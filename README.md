@@ -43,11 +43,15 @@
 设置 → **插件市场** → **发现** → 索引源填下面这个地址，回车/保存：
 
 ```
-https://raw.githubusercontent.com/LeonhardJY/dsh-teacher-kit/main/market/index.json
+https://fastly.jsdelivr.net/gh/LeonhardJY/dsh-teacher-kit@main/market/index.json
 ```
 
 刷新后出现「教师助手」卡片 → 安装（实际走 `git+https://github.com/LeonhardJY/dsh-teacher-kit.git#<提交号>`，
 固定在某个提交上，不会随便变）→ 重启 DSH。
+
+> 为什么要用 jsDelivr 而不是 GitHub 的 raw 地址：国内直连 `raw.githubusercontent.com` 经常连不上
+> （本次实测就是 000），而 `fastly.jsdelivr.net` 稳定返回 200。原始地址备着，能用就一样：
+> `https://raw.githubusercontent.com/LeonhardJY/dsh-teacher-kit/main/market/index.json`
 
 ### 办法 B：本地安装（现在）
 

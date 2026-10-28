@@ -89,14 +89,14 @@
       "versions": [
         {
           "version": "0.18.0",
-          "publishTimestamp": 1793193651,
+          "publishTimestamp": 1793195144,
           "source": {
             "type": "git",
             "url": "https://github.com/LeonhardJY/dsh-teacher-kit.git",
-            "commit": "e94175b18564fa1fefc74cd24ef521e0b2fc57a6"
+            "commit": "b42b52bfd090c5c3fb539c96934ee424f0dd2d5f"
           },
           "engines": {
-            "dsh": ">=0.2.1-rc.2"
+            "dsh": ">=0.2.1-rc.2 <0.3.0 || >=0.3.0-0"
           }
         }
       ]

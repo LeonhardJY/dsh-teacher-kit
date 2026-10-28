@@ -1,0 +1,14 @@
+# 运行产物与测试证据（不进仓库；发布包另有 .npmignore）
+.verify/
+.smoke/
+.perf/
+.pytest_cache/
+tmp-review/
+_probe/
+reviews/
+dist/
+node_modules/
+*.log
+__pycache__/
+*.pyc
+.DS_Store

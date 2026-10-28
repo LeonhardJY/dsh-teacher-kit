@@ -1,0 +1,12 @@
+# 发布包里只要运行所需的东西（与 scripts/package.mjs 的 FILES 同一口径）。
+# 测试、源码前身、审查记录、真机证据、旧包都不进包。
+engine/tests/
+**/__pycache__/
+**/*.pyc
+test/
+src/
+reviews/
+dist/
+.verify/
+.perf/
+*.log

@@ -1,0 +1,2582 @@
+/**
+ * dsh-teacher-kit — client half (factory body).
+ *
+ * 挂在 conversation.input.right：输入框右侧那一排（模型选择器左边）——一个 28px 的小按钮。
+ * 点一下弹出自己的浮层面板（position: fixed 的对话框），不占用宿主的工具栏布局。
+ *
+ * ⚠️ 为什么不是 conversation.input.activity：
+ * 那个槽是 **single**（kind: "single"），全客户端只允许一个注册者，官方语音输入插件
+ * 就占着它。我们注册进去会把它挤掉，它的 activate 直接抛
+ *   Error: single slot "conversation.input.activity" already has a registration at priority 0
+ *          (registered by dsh-teacher-kit) — register at a different priority to shadow it
+ * → web boot 报 "1 entry did not activate" → 整个界面卡在「Loading plugins…」
+ * （2026-10-25 真机实测：装了我们插件，DSH 桌面版/网页版都起不来）。
+ * 换成 list 槽位（input.right 是 kind: "list"）才能和别人的按钮并存。
+ *
+ * 槽位契约（scope: "session"）：组件收到 { sessionId, ... }；没有 onActiveChange，
+ * 所以展开/收起由面板自己管。
+ *
+ * 只用 React.createElement（不引入构建期 JSX），require 只碰 loader 认识的
+ * 'react' / 'react/jsx-runtime' / 'react-dom' / dsh-client-ui-primitives。
+ */
+const React = require('react')
+const h = React.createElement
+
+const NS = 'dsh-teacher-kit'
+const SLOT = 'conversation.input.right'
+const API = '/teacher-kit/api'
+
+const COLORS = {
+  border: 'rgba(127,127,127,0.35)',
+  borderStrong: 'rgba(127,127,127,0.55)',
+  muted: 'rgba(127,127,127,0.9)',
+  // 走面板里的 CSS 令牌：深色模式自动换成更亮的绿/红（原来写死 #16a34a/#dc2626，深色下 12px 字看不清）。
+  ok: 'var(--tk-ok)',
+  bad: 'var(--tk-bad)',
+  accent: 'rgba(59,130,246,0.12)'
+}
+
+/**
+ * 面板请求统一入口：服务端要求自定义头，漏一个就是 403（reviews/step1-skeleton.md S1）。
+ *
+ * **必须带超时**：宿主或 Python 卡住（LibreOffice 死锁、超大文档、代理挂起）时，
+ * 没有超时的 fetch 会让 busy 永远为真、按钮永久灰着，老师只能刷新整个页面。
+ * 引擎类请求给 180s（出整套＋导 PDF 本来就慢），其余 30s。
+ */
+const DEFAULT_TIMEOUT = 30_000
+function api(path, init) {
+  const options = init || {}
+  const headers = Object.assign({ accept: 'application/json', 'x-teacher-kit': '1' }, options.headers || {})
+  const timeout = Number(options.timeoutMs) || DEFAULT_TIMEOUT
+  const rest = Object.assign({}, options)
+  delete rest.timeoutMs
+  const controller = typeof AbortController === 'function' ? new AbortController() : null
+  let timer = null
+  if (controller) {
+    if (!rest.signal) rest.signal = controller.signal
+    timer = setTimeout(function () {
+      try { controller.abort() } catch { /* 已经结束 */ }
+    }, timeout)
+  }
+  const settle = function () { if (timer && typeof clearTimeout === 'function') clearTimeout(timer) }
+  const promise = fetch(API + path, Object.assign(rest, { headers })).then(
+    function (response) { settle(); return response },
+    function (error) {
+      settle()
+      if (error && (error.name === 'AbortError' || error.code === 20)) {
+        throw new Error('等太久没回话（超过 ' + Math.round(timeout / 1000) + ' 秒），可以再点一次')
+      }
+      throw error
+    }
+  )
+  promise.catch(function () { /* 调用方各自处理，这里只防未处理拒绝 */ })
+  return promise
+}
+
+/**
+ * 读 JSON 回包。网关/代理回 HTML 错误页时不能把
+ * 「Unexpected token '<'」这种话直接端给老师看。
+ */
+function readJson(response) {
+  if (typeof response.text !== 'function' && typeof response.json === 'function') return response.json()
+  return response.text().then(function (raw) {
+    try {
+      return JSON.parse(raw)
+    } catch {
+      throw new Error('服务回了非预期内容（HTTP ' + response.status + '）：' + String(raw || '').trim().slice(0, 80))
+    }
+  })
+}
+
+const TRIGGER = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: '6px',
+  height: '28px',
+  padding: '0 10px',
+  borderRadius: '8px',
+  border: '1px solid ' + COLORS.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '12px',
+  lineHeight: 1,
+  cursor: 'pointer',
+  whiteSpace: 'nowrap'
+}
+
+const PANEL = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '10px',
+  flexWrap: 'wrap',
+  width: '100%',
+  minWidth: 0,
+  boxSizing: 'border-box'
+}
+
+/** 浮层遮罩：点空白处收起（和常见对话框一致）。 */
+const BACKDROP = {
+  position: 'fixed',
+  top: 0,
+  right: 0,
+  bottom: 0,
+  left: 0,
+  zIndex: 2147483000,
+  background: 'rgba(15,23,42,0.42)',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: '20px'
+}
+
+/** 面板本体：固定宽、最高 84vh、内部滚动。系统色 Canvas/CanvasText 跟着浅色深色走。 */
+const DIALOG = {
+  width: 'min(760px, 94vw)',
+  maxHeight: '84vh',
+  overflowY: 'auto',
+  boxSizing: 'border-box',
+  padding: '16px 18px 18px',
+  borderRadius: '14px',
+  border: '1px solid ' + COLORS.border,
+  background: 'var(--dsh-surface, Canvas)',
+  color: 'var(--dsh-text, CanvasText)',
+  boxShadow: '0 24px 60px rgba(0,0,0,0.28)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '10px',
+  font: 'inherit',
+  fontSize: '13px',
+  textAlign: 'left'
+}
+
+const CARD = {
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'flex-start',
+  gap: '2px',
+  padding: '6px 12px',
+  borderRadius: '9px',
+  border: '1px solid ' + COLORS.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  textAlign: 'left',
+  cursor: 'pointer',
+  minWidth: '132px'
+}
+
+const TASKS = [
+  { id: 'exam', label: '出试卷', hint: '套学校模板 · 答题卡 · 答案卷 · 印前检查' },
+  { id: 'bank', label: '题库组卷', hint: 'Excel / Word 题库直接出卷，不用复制粘贴' },
+  { id: 'dictation', label: '听写单', hint: '单词表 → 双栏听写纸，可附答案' },
+  { id: 'plan', label: '教案', hint: '按学校格式排版：课题 · 目标 · 过程 · 板书' },
+  { id: 'deck', label: '做课件', hint: '用学校 PPT 模板 · 自动分页 · 讲稿进备注' },
+  { id: 'pack', label: '整套', hint: '一节课一次做齐：试卷 · 听写单 · 教案 · 课件（填了哪栏就出哪件）' },
+  { id: 'file', label: '文件加工', hint: '净化格式 · 合并 · 提取文字 · 检查卷子' },
+  { id: 'template', label: '模板', hint: '把上学期那份卷子变成下学期能用的空白模板' }
+]
+
+// v0.15 的十个入口。宿主 /profile 会把同样的清单连同说明一起发下来；
+// 这里只是"网络还没回"时先能看见东西的兜底，文案与 lib/guide.js 保持一致。
+const GUIDE_FALLBACK = [
+  { key: 'exam', label: '出试卷', brief: '单元卷 / 月考卷，套学校模板或按 8 开两栏排' },
+  { key: 'bank', label: '题库组卷', brief: '粘贴或导入一批题，按题型/难度组一份卷' },
+  { key: 'dictation', label: '听写单', brief: '单词/短语听写单，带中文提示与行距' },
+  { key: 'plan', label: '教案', brief: '一节课的教案：表格式 / 流程式，按你学校的排版' },
+  { key: 'deck', label: '做课件', brief: '配套 PPT：字大、页少、能直接投' },
+  { key: 'pack', label: '一节课整套', brief: '教案 + 课件 + 练习 + 听写单，一次配齐' },
+  { key: 'files', label: '文件加工', brief: '合并 / 拆取 / 清格式 / 转 PDF / 套模板' },
+  { key: 'wechat', label: '公众号推文', brief: '学校活动宣传稿：标题 → 正文 → 可粘贴的排版' },
+  { key: 'docflow', label: '公文流转', brief: '上级来文 → 登记 → 拟办 → 批示 → 流转 → 回复稿' },
+  { key: 'profile', label: '设定我的学校', brief: '把学校、学段学科、卷面规格、教案版式、课件风格记下来' }
+]
+
+const FIELD = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '4px',
+  flex: '1 1 220px',
+  minWidth: 0
+}
+
+const LABEL = { fontSize: '11px', color: COLORS.muted }
+
+const INPUT = {
+  width: '100%',
+  boxSizing: 'border-box',
+  padding: '6px 8px',
+  borderRadius: '7px',
+  border: '1px solid ' + COLORS.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '12px'
+}
+
+const BUTTON = {
+  padding: '7px 14px',
+  borderRadius: '8px',
+  border: '1px solid ' + COLORS.borderStrong,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '12px',
+  cursor: 'pointer'
+}
+
+/** v0.15 任务行：左边名字、右边一句"这件事做什么"，整行可点（比一排小pill好点得多）。 */
+const TASK_ROW = {
+  display: 'grid',
+  gridTemplateColumns: '92px 1fr',
+  alignItems: 'center',
+  gap: '10px',
+  width: '100%',
+  padding: '7px 10px',
+  borderRadius: '8px',
+  border: '1px solid ' + COLORS.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  cursor: 'pointer',
+  textAlign: 'left'
+}
+
+/** 任务标签页：小而扁，三个并排只占一行。 */
+const PILL = {
+  padding: '5px 12px',
+  borderRadius: '999px',
+  border: '1px solid ' + COLORS.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '12px',
+  lineHeight: 1.4,
+  cursor: 'pointer'
+}
+const PILL_ON = { borderColor: COLORS.borderStrong, background: COLORS.accent, fontWeight: 600 }
+
+const FORM = {
+  flexBasis: '100%',
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: '10px',
+  paddingTop: '8px',
+  borderTop: '1px solid ' + COLORS.border
+}
+
+const NOTE = { flexBasis: '100%', fontSize: '11px', color: COLORS.muted, lineHeight: 1.6 }
+
+/** 一个图标（内联 SVG，跟随文字颜色，浅色深色都正常）。 */
+function BookIcon() {
+  return h(
+    'svg',
+    { width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
+    h('path', { d: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20' }),
+    h('path', { d: 'M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z' })
+  )
+}
+
+/**
+ * 底栏的体检结论。检查不过时可以点一下重查——原来失败一次就永久「体检失败」，
+ * 老师装完 Python 得刷新整个页面（审查 C-13）。
+ */
+function StatusChip(props) {
+  const { state, onRetry } = props
+  if (!state) return h('span', { style: { fontSize: '12px', color: COLORS.muted } }, '引擎检查中…')
+  const retry = function () { if (onRetry) onRetry() }
+  const broken = !!state.error || !state.ok
+  const detail = state.error
+    ? '体检没通过：' + state.error
+    : state.ok
+      ? (state.canConvertPdf ? 'Python + LibreOffice 就绪' : 'Python 就绪 · 缺 LibreOffice，PDF 导出不可用')
+      : '没找到 Python 运行时：装一个 3.10 以上再点这里'
+  const body = [
+    h('span', {
+      key: 'dot',
+      style: { width: 7, height: 7, borderRadius: '50%', background: state.ok && !state.error ? COLORS.ok : COLORS.bad }
+    }),
+    detail
+  ]
+  if (!broken) {
+    return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: COLORS.muted } }, body)
+  }
+  return h(
+    'button',
+    {
+      type: 'button',
+      className: 'tk-ghost',
+      title: '重新检查 Python 与 LibreOffice',
+      onClick: retry,
+      style: { display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: COLORS.bad, border: 'none', background: 'transparent', padding: 0, cursor: 'pointer', textAlign: 'left' }
+    },
+    body,
+    h('span', { key: 'again', style: { textDecoration: 'underline', marginLeft: '2px' } }, '重查')
+  )
+}
+
+/** 引擎调用：/engine 单入口，错误一律带 code/message/hint，面板照原样给老师看。 */
+function engine(command, args) {
+  return api('/engine', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    // 客户端 190s、宿主 180s：宿主先到点，老师拿到的是引擎的中文超时说明，
+    // 而不是客户端硬砍掉连接造成的"未知失败"。
+    timeoutMs: 190_000,
+    body: JSON.stringify({ command, args: args || {}, timeoutMs: 180000 })
+  }).then(function (r) {
+    return readJson(r).then(function (body) {
+      // 宿主真实回包是信封形态：成功 {ok:true, data:{...}}，失败 {ok:false, error:{code,message,hint}}。
+      // 面板只吃业务对象，所以在这里拆一层，别让调用方到处写 body.data。
+      const payload = body && body.data && typeof body.data === 'object' ? body.data : body
+      if (body && body.ok === false) {
+        const detail = body.error && typeof body.error === 'object' ? body.error : {}
+        const text = detail.message || body.message || detail.code || body.error || '引擎返回失败'
+        const error = new Error(typeof text === 'string' ? text : JSON.stringify(text))
+        error.code = detail.code || body.code
+        error.hint = detail.hint || body.hint
+        throw error
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status)
+      return payload
+    })
+  })
+}
+
+/**
+ * 导 PDF。**失败原因必须带回来**：以前 catch 成 {ok:false} 把宿主的
+ * code/message/hint 全丢了，结果卡上既没有 PDF 按钮也没有一句提示，老师只能去
+ * 文件夹里找一份根本不存在的文件。
+ */
+function exportPdf(path) {
+  return api('/export-pdf', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path })
+  })
+    .then(function (r) {
+      return readJson(r).then(
+        function (body) { return body || { ok: false } },
+        function () { return { ok: false, error: { message: '导出服务回了 HTTP ' + r.status + '（不是 JSON）' } } }
+      )
+    })
+    .catch(function (error) {
+      return { ok: false, error: { message: (error && error.message) || '导出服务没回话' } }
+    })
+}
+
+/** 把宿主给的 error（对象 / 字符串 / 空）压成一句能印在结果卡上的话。 */
+function errorText(error) {
+  if (!error) return ''
+  if (typeof error === 'string') return error
+  if (typeof error === 'object') {
+    const head = error.message || error.code || ''
+    const hint = error.hint ? '（' + error.hint + '）' : ''
+    return String(head) + hint
+  }
+  return String(error)
+}
+
+function reveal(path) {
+  return api('/reveal', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path })
+  }).catch(function () { /* 打不开文件夹不该让面板报错 */ })
+}
+
+/** 列一层目录（面板的文件选择器）。 */
+function listDir(dir, kinds) {
+  return api('/list-dir', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dir: dir || undefined, kinds: kinds || undefined })
+  }).then(function (r) { return readJson(r) })
+}
+
+/**
+ * 把本地预览图变成能放进 <img> 的地址。
+ * 浏览器加载图片时带不上自定义头，所以先 fetch 成 blob 再转 objectURL；
+ * 老浏览器没有 createObjectURL 时退回 dataURL。
+ */
+function loadImageUrl(path) {
+  if (!path) return Promise.resolve(null)
+  return api('/file?path=' + encodeURIComponent(path))
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status)
+      return r.blob()
+    })
+    .then(function (blob) {
+      if (typeof URL !== 'undefined' && URL.createObjectURL) return URL.createObjectURL(blob)
+      return new Promise(function (done) {
+        const reader = new FileReader()
+        reader.onload = function () { done(reader.result) }
+        reader.onerror = function () { done(null) }
+        reader.readAsDataURL(blob)
+      })
+    })
+    .catch(function () { return null })
+}
+
+/** 出完文件顺手渲染第一页：老师不用下载就能确认"长这样"，预览即成品。 */
+function renderPreview(path, pdfPath) {
+  if (!path) return Promise.resolve(null)
+  return api('/render', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ inputPath: path, pdfPath: pdfPath || undefined })
+  })
+    .then(function (r) { return readJson(r) })
+    .then(function (body) {
+      const payload = body && body.data && typeof body.data === 'object' ? body.data : body
+      const pages = payload && payload.pages
+      if (!payload || payload.ok === false || !Array.isArray(pages) || pages.length === 0) return null
+      return { pageCount: payload.pageCount || pages.length, first: pages[0].file }
+    })
+    .catch(function () { return null })
+}
+
+function findingsLines(preflight) {
+  if (!preflight) return []
+  const lines = []
+  const label = preflight.level === 'pass' ? '印前检查通过' : preflight.level === 'warn' ? '印前检查：有提醒' : '印前检查没通过'
+  lines.push(label + '（' + preflight.score + ' 分）')
+  ;(preflight.findings || []).slice(0, 4).forEach(function (item) {
+    lines.push('· ' + (item.message || item.code))
+  })
+  if ((preflight.findings || []).length > 4) lines.push('· 还有 ' + ((preflight.findings || []).length - 4) + ' 条，见导出的检查结果')
+  return lines
+}
+
+/**
+ * 一份"能打印的纸"的统一收尾：印前门 → 导 PDF → 渲染第一页。
+ * 试卷 / 题库组卷 / 听写单 / 教案都走同一条，老师的体验才一致。
+ */
+function finishPaper(result, lines, options, label) {
+  const title = label || '试卷已生成'
+  const secondPath = result && result.secondPath
+  const multiSets = Array.isArray(result && result.sets) && result.sets.length > 1 ? result.sets : null
+  if (multiSets) {
+    // 分套时每套的题型分布、印前结论都不一样，只看第 1 套的会误导读卷老师
+    lines.push('每套的印前检查：' + multiSets.map(function (item) {
+      const level = item.preflight && item.preflight.level
+      return item.label + ' ' + (level === 'pass' ? '通过' : (level === 'fail' ? '有问题' : '有提醒'))
+    }).join(' · '))
+  } else {
+    ;(result.sections || []).forEach(function (section) {
+      if (typeof section.questions === 'number') {
+        lines.push('· ' + (section.title || '试题') + '：' + section.questions + ' 题 ' + section.score + ' 分')
+      }
+    })
+    findingsLines(result.preflight).forEach(function (line) { lines.push(line) })
+  }
+  ;(result.warnings || []).forEach(function (warning) { lines.push('提醒：' + (warning.message || warning.code)) })
+  const firstLabel = result && result.secondLabel ? 'Word（学生卷）' : (secondPath ? 'Word（A 卷）' : 'Word')
+  const secondLabel = (result && result.secondLabel) || 'Word（B 卷）'
+  const paths = []
+  if (multiSets) {
+    multiSets.forEach(function (item) { paths.push({ label: 'Word（' + item.label + '）', path: item.outputPath }) })
+  } else {
+    paths.push({ label: firstLabel, path: result.outputPath })
+    if (secondPath) paths.push({ label: secondLabel, path: secondPath })
+  }
+  ;(result.extraPaths || []).forEach(function (item) { if (item && item.path) paths.push(item) })
+  // 印前检查有 error 就不导 PDF：改成"改完再印"这一步，别让不合格的卷子直接进打印店。
+  // **分套时必须逐套判**：只看 result.preflight（=第 1 套）会出现"界面写着第 2 套有问题、
+  // 第 2 套的 PDF 却照样导出来"；第 1 套 fail 时又会把通过的套一起扣住。
+  const failedPreflight = function (pf) { return Boolean(pf && pf.level === 'fail') }
+  const firstErrorOf = function (pf) {
+    const found = ((pf && pf.findings) || []).filter(function (item) { return item.level === 'error' })[0]
+    return found ? found.message : '印前检查没通过'
+  }
+  const targets = []
+  if (multiSets) {
+    multiSets.forEach(function (item) {
+      if (failedPreflight(item.preflight)) {
+        lines.push('第 ' + item.label + ' 套的 PDF 先不导：' + firstErrorOf(item.preflight) + '（Word 已生成，改完再导一次）')
+      } else {
+        targets.push({ path: item.outputPath, label: 'PDF（' + item.label + '）' })
+      }
+    })
+  } else if (failedPreflight(result.preflight)) {
+    lines.push('PDF 先不导：' + firstErrorOf(result.preflight) + '（Word 已生成，改完再导一次）')
+  } else {
+    targets.push({ path: result.outputPath, label: 'PDF' })
+    if (secondPath) {
+      targets.push({ path: secondPath, label: 'PDF' + (result && result.secondLabel ? '（教师卷）' : '（B 卷）') })
+    }
+  }
+  const blocked = targets.length === 0
+  const wanted = Boolean(options && options.pdf) && !blocked
+  const exportOne = function (path, label) {
+    return exportPdf(path).then(function (pdf) {
+      const pdfPath = pdf && pdf.ok && pdf.pdf ? pdf.pdf : null
+      if (pdfPath) {
+        paths.push({ label: label || 'PDF', path: pdfPath })
+        return pdfPath
+      }
+      // 导不出来必须说清楚是哪份、为什么 —— 静默失败会让老师去文件夹里找空气。
+      const reason = errorText(pdf && pdf.error) || '没拿到 PDF（原因不明）'
+      lines.push((label || 'PDF') + ' 没导出来：' + reason)
+      return null
+    })
+  }
+  const exported = wanted
+    ? targets.reduce(function (chain, item) {
+      return chain.then(function (firstPdf) {
+        return exportOne(item.path, item.label).then(function (pdfPath) { return firstPdf || pdfPath })
+      })
+    }, Promise.resolve(null))
+    : Promise.resolve(null)
+  return exported.then(function (pdfPath) {
+    // 顺手渲染第一页：老师不下载也能确认"长这样"。预览失败不影响交付。
+    return renderPreview(result.outputPath, pdfPath).then(function (preview) {
+      return {
+        title: blocked ? title + '（PDF 待改）' : title,
+        lines: lines,
+        paths: paths,
+        preflight: result.preflight,
+        preview: preview || undefined
+      }
+    })
+  })
+}
+
+/** 纸型：老师嘴里的叫法 → paper.resolve 认的 {size, orientation, columns}。 */
+const PAPERS = {
+  '8K-2': { size: '8K', orientation: 'landscape', columns: 2 },
+  '8K-1': { size: '8K', orientation: 'landscape', columns: 1 },
+  'A3-2': { size: 'A3', orientation: 'landscape', columns: 2 },
+  'A3-1': { size: 'A3', orientation: 'landscape', columns: 1 },
+  '16K-1': { size: '16K', orientation: 'portrait', columns: 1 },
+  'A4-1': { size: 'A4', orientation: 'portrait', columns: 1 }
+}
+
+/** 出试卷：题干 → docx（套模板/答题卡/答案卷）→ 顺手导 PDF。 */
+function buildExam(draft, options) {
+  const args = {
+    text: draft.text,
+    title: draft.title || undefined,
+    baseTemplate: draft.template || undefined,
+    // 选了学校模板就按模板的纸型来（引擎会去读模板），别再拿下拉里的默认 8 开硬盖
+    page: draft.template ? undefined : (PAPERS[draft.paper || '8K-2'] || PAPERS['8K-2']),
+    // 页脚那两格：填了真名就印真名，没填引擎自己留手写横线
+    values: {
+      className: String(draft.className || '').trim() || undefined,
+      teacherName: String(draft.teacherName || '').trim() || undefined
+    },
+    options: {
+      minutes: draft.minutes ? Number(draft.minutes) : undefined,
+      answerCard: draft.card ? 'card' : 'none',
+      answerSheet: draft.answers ? 'end' : 'none',
+      // 答题卡上填空题留几行（选择/判断不占格，填空、简答才有作答区）
+      fillLines: draft.fillLines ? Number(draft.fillLines) : undefined
+    }
+  }
+  const ab = Boolean(draft.ab)
+  const teacher = Boolean(draft.teacher)
+  // A/B 与教师卷可以一起要：四份（A / B / A 教师 / B 教师），引擎一次出完
+  if (teacher) args.options.teacher = true
+  return engine(ab ? 'exam:build-ab' : (teacher ? 'exam:build-teacher' : 'exam:build'), args).then(function (result) {
+    const lines = ['共 ' + result.questionCount + ' 题，合计 ' + result.totalScore + ' 分']
+    if (teacher && !ab) {
+      if (result.teacherPath) {
+        result.secondPath = result.teacherPath
+        // 没有 A/B 时第二份是教师卷，label 不写清会被当成 B 卷发给学生
+        result.secondLabel = 'Word（教师卷）'
+      }
+      lines.unshift('学生卷 + 教师卷都出好了：教师卷把答案和解析印在每道题下面')
+    }
+    if (teacher && ab && Array.isArray(result.teacherPaths) && result.teacherPaths.length) {
+      // 四份：A/B 走主副路径，两份教师卷挂在 extraPaths 上（finishPaper 会把它们接进路径按钮）
+      result.extraPaths = (result.extraPaths || []).concat(result.teacherPaths.map(function (path, index) {
+        return { label: index === 0 ? 'Word（A 卷教师）' : 'Word（B 卷教师）', path: path }
+      }))
+      lines.unshift('A/B 两卷 + 两份教师卷都出好了：教师卷把答案和解析印在每道题下面')
+    }
+    if (ab && Array.isArray(result.variants) && result.variants.length > 1) {
+      const second = result.variants[1]
+      if (second && second.outputPath) result.secondPath = second.outputPath
+      lines.unshift('A/B 两卷已出：B 卷选项顺序打乱，答案跟着改了')
+      ;(result.warnings || []).forEach(function (warning) {
+        if (warning.code === 'ab-no-shuffle') lines.push('提醒：' + warning.message)
+      })
+    }
+    const paperTitle = ab && teacher ? 'A/B 两卷 + 两份教师卷已生成' : (ab ? 'A/B 两卷已生成' : (teacher ? '学生卷 + 教师卷已生成' : '试卷已生成'))
+    // 听力录音稿一起念成 wav：上课不用自己读，也不依赖网络。念不出来只提醒，不拦卷子。
+    const audioText = String(draft.listening || '').trim()
+    const withAudio = Boolean(draft.listeningAudio) && audioText !== ''
+      ? engine('audio:script', {
+        text: audioText,
+        title: (draft.title || '听力') + ' 听力',
+        pauseSec: 4,
+        passes: draft.listeningPasses ? Number(draft.listeningPasses) : 1
+      }).then(function (audio) {
+        if (audio && audio.outputPath) {
+          // 一定要 concat：A/B+教师卷场景下 extraPaths 里已经挂着两份教师卷，
+          // 整体赋值会把它们从结果卡上挤掉（卷子在磁盘上，老师却找不到入口）。
+          result.extraPaths = (result.extraPaths || []).concat([{ label: '听力音频（wav）', path: audio.outputPath }])
+        }
+        const total = Math.round(Number(audio.seconds) || 0)
+        const mins = Math.floor(total / 60)
+        const secs = total % 60
+        lines.push('听力音频：' + (mins ? mins + ' 分 ' : '') + secs + ' 秒，' + (audio.lines || audioText.split(/\r?\n/).length) + ' 句（用 Windows 自带的语音念的，点开就能放）')
+      }).catch(function (error) {
+        lines.push('听力音频没生成：' + ((error && error.message) || error) + '（卷子不受影响，录音稿还在）')
+      })
+      : Promise.resolve()
+    return withAudio.then(function () { return finishPaper(result, lines, options, paperTitle) })
+  })
+}
+
+/** 题库组卷：Excel / Word 表格里的题 → 一份卷子，老师不用复制粘贴。 */
+function buildBank(draft, options) {
+  return engine('bank:build', {
+    path: draft.source,
+    title: draft.title || undefined,
+    baseTemplate: draft.template || undefined,
+    page: draft.template ? undefined : (PAPERS[draft.paper || '8K-2'] || PAPERS['8K-2']),
+    values: {
+      className: String(draft.className || '').trim() || undefined,
+      teacherName: String(draft.teacherName || '').trim() || undefined
+    },
+    options: {
+      minutes: draft.minutes ? Number(draft.minutes) : undefined,
+      answerCard: draft.card ? 'card' : 'none',
+      answerSheet: draft.answers ? 'end' : 'none',
+      fillLines: draft.fillLines ? Number(draft.fillLines) : undefined,
+      pick: parsePick(draft.pick) || undefined,
+      sets: draft.sets ? Number(draft.sets) : undefined,
+      ab: Boolean(draft.ab),
+      teacher: Boolean(draft.teacher)
+    }
+  }).then(function (result) {
+    const bank = result.bank || {}
+    // 只报"从哪读的、读进多少"，分节与分值统一由 finishPaper 报，避免同一条出现两遍
+    const picked = bank.picked
+      ? '按题型挑出 ' + result.questionCount + ' 题（题库里一共 ' + (bank.available || bank.count || 0) + ' 题）'
+      : '从题库读进 ' + (bank.count || 0) + ' 题（' + (bank.format || '表格') + '）'
+    const lines = [picked + '，合计 ' + result.totalScore + ' 分']
+    const sets = Array.isArray(result.sets) && result.sets.length > 1 ? result.sets : null
+    if (sets) {
+      lines[0] = '同一批题分成 ' + sets.length + ' 套，一共 ' + (result.bank && result.bank.count ? result.bank.count : result.questionCount) + ' 题'
+      sets.forEach(function (item) {
+        const ok = item.preflight && item.preflight.level === 'pass'
+        lines.push('· ' + item.label + '：' + item.questionCount + ' 题 ' + item.totalScore + ' 分' + (ok ? '（检查通过）' : ''))
+      })
+    }
+    if (result.ab && Array.isArray(result.teacherPaths) && result.teacherPaths.length) {
+      lines.unshift('A/B 两卷 + 两份教师卷都出好了：教师卷把答案和解析印在每道题下面')
+      if (result.variants && result.variants[1]) result.secondPath = result.variants[1].outputPath
+      result.extraPaths = (result.extraPaths || []).concat(result.teacherPaths.map(function (path, index) {
+        return { label: index === 0 ? 'Word（A 卷教师）' : 'Word（B 卷教师）', path: path }
+      }))
+    } else if (result.teacherPath) {
+      result.secondPath = result.teacherPath
+      result.secondLabel = result.secondLabel || 'Word（教师卷）'
+      lines.unshift('学生卷 + 教师卷都出好了：教师卷把答案和解析印在每道题下面')
+    } else if (result.ab) {
+      lines.unshift('A/B 两卷已出：B 卷选项顺序打乱，答案跟着改了')
+      if (result.variants && result.variants[1]) result.secondPath = result.variants[1].outputPath
+    }
+    ;(bank.warnings || []).forEach(function (warning) { lines.push('题库提醒：' + (warning.message || warning.code)) })
+    return finishPaper(result, lines, options,
+      sets ? '分套卷子已生成（共 ' + sets.length + ' 套）'
+        : (result.ab && result.teacherPaths && result.teacherPaths.length
+          ? 'A/B 两卷 + 两份教师卷已生成'
+          : (result.teacherPath ? '学生卷 + 教师卷已生成' : (result.ab ? 'A/B 两卷已生成' : '试卷已生成'))))
+  })
+}
+
+/** 听写/默写单：单词表 → 双栏听写纸（可附答案，也可以顺手念一段音频）。 */
+function buildDictation(draft, options) {
+  const wantAudio = Boolean(draft.audio)
+  const audio = wantAudio
+    ? engine('handout:audio', {
+      text: draft.text || undefined,
+      source: draft.source || undefined,
+      title: draft.title || undefined,
+      mode: draft.mode || 'en2cn',
+      repeat: draft.repeat ? Number(draft.repeat) : 2,
+      pauseSec: draft.pause ? Number(draft.pause) : 6
+    }).then(
+      function (clip) { return { clip: clip } },
+      // 音频念不出来（没语音包 / 太长 / 文件占用）只提醒，别把已经排好的听写单一起吞掉
+      function (error) { return { error: error } }
+    )
+    : Promise.resolve(null)
+  return Promise.all([
+    engine('handout:build', {
+      text: draft.text || undefined,
+      source: draft.source || undefined,
+      title: draft.title || undefined,
+      mode: draft.mode || 'en2cn',
+      columns: draft.columns ? Number(draft.columns) : 2,
+      answer: Boolean(draft.answers)
+    }),
+    audio
+  ]).then(function (both) {
+    const result = both[0]
+    const audioOutcome = both[1]
+    const clip = audioOutcome && audioOutcome.clip
+    const lines = ['共排进 ' + result.count + ' 条，' + result.columns + ' 栏']
+    if (audioOutcome && audioOutcome.error) {
+      lines.push('听写音频没生成：' + errorText(audioOutcome.error) + '（单子不受影响，可以自己念）')
+    }
+    if (draft.answers) lines.push('最后一页是参考答案（可以直接印，也可以撕下来）')
+    if (clip) {
+      const minutes = Math.floor(clip.seconds / 60)
+      const rest = Math.round(clip.seconds - minutes * 60)
+      const length = minutes ? minutes + ' 分 ' + rest + ' 秒' : rest + ' 秒'
+      lines.push('听写音频：' + length + '，' + clip.count + ' 条（点播放就能听；用 Windows 自带的语音念的）')
+      ;(clip.warnings || []).forEach(function (warning) { lines.push('音频提醒：' + (warning.message || warning.code)) })
+      result.extraPaths = (result.extraPaths || []).concat([{ label: '听写音频（wav）', path: clip.outputPath }])
+    }
+    ;(result.warnings || []).forEach(function (warning) { lines.push('提醒：' + (warning.message || warning.code)) })
+    return finishPaper(result, lines, options, '听写单已生成')
+  })
+}
+
+/** 做课件：内容 → pptx（优先用老师自己的模板）。 */
+function buildDeck(draft, options) {
+  const html = draft.format === 'html'
+  return engine(html ? 'lesson:html' : 'lesson:deck', {
+    text: draft.text,
+    title: draft.title || undefined,
+    template: html ? undefined : draft.template || undefined,
+    options: {}
+  }).then(function (result) {
+    const lines = ['共 ' + result.slides + ' 页']
+    ;(result.outline || []).slice(0, 8).forEach(function (item) {
+      lines.push('· ' + (item.title || '（无标题）') + (item.bullets ? '：' + item.bullets + ' 条' : ''))
+    })
+    if ((result.outline || []).length > 8) lines.push('· 还有 ' + (result.outline.length - 8) + ' 页')
+    if (html) lines.push('双击用浏览器打开：← → 翻页，N 看讲稿，Ctrl+P 一页一张')
+    ;(result.warnings || []).forEach(function (warning) { lines.push('提醒：' + (warning.message || warning.code)) })
+    // 网页课件没法逐页出图预览，直接把结构报给老师
+    if (html) {
+      return { title: '网页课件已生成', lines: lines, paths: [{ label: 'HTML', path: result.outputPath }] }
+    }
+    return renderPreview(result.outputPath).then(function (preview) {
+      return {
+        title: '课件已生成',
+        lines: lines,
+        paths: [{ label: 'PPTX', path: result.outputPath }],
+        preview: preview || undefined
+      }
+    })
+  })
+}
+
+/** 教案：老师手上那份草稿 → 学校格式的 Word。 */
+function buildPlan(draft, options) {
+  return engine('plan:build', {
+    text: draft.text,
+    title: draft.title || undefined,
+    layout: draft.layout || 'form',
+    teacher: draft.teacher || undefined,
+    className: draft.className || undefined,
+    periods: draft.periods || undefined
+  }).then(function (result) {
+    const sections = result.sections || []
+    const lines = [
+      '认出了 ' + result.fieldCount + ' 个字段、' + sections.length + ' 个教学环节（' + (result.layout === 'flow' ? '流程版' : '表格式') + '）'
+    ]
+    if (sections.length) {
+      lines.push('· 环节：' + sections.slice(0, 6).join(' / ') + (sections.length > 6 ? ' …' : ''))
+    }
+    return finishPaper(result, lines, options, '教案已生成')
+  })
+}
+
+/** 模板：把上学期那份卷子变成空白模板（页眉页脚换占位符，正文清空，版式不动）。 */
+function buildTemplate(draft) {
+  return engine('template:make', {
+    source: draft.source,
+    outputPath: draft.outputPath || undefined
+  }).then(function (result) {
+    const paper = result.paper || {}
+    const layout = result.buildPage || {}
+    const lines = []
+    const sizeText = paper.size || (layout.sizeMm ? layout.sizeMm.width + '×' + layout.sizeMm.height + 'mm' : '')
+    if (sizeText) {
+      const columns = layout.columns && layout.columns > 1 ? layout.columns + ' 栏' : '一栏'
+      lines.push('认出的版式：' + sizeText + ' · ' + columns + ' · ' + (layout.orientation === 'landscape' ? '横向' : '竖向'))
+    }
+    lines.push('页眉页脚里有 ' + (result.placeholderLines || 0) + ' 行换成了 {{学年}} / {{页码}} 这类占位符')
+    lines.push('正文题目已经清空，只留标题行和「满分 / 时间」说明行')
+    lines.push('以后出卷：在「出试卷」里把这份模板选上，题干粘进来就行')
+    ;(result.conflicts || []).slice(0, 3).forEach(function (conflict) {
+      lines.push('注意：' + (conflict.path || '') + ' 两份样本不一致（' + (conflict.value || '') + '）')
+    })
+    ;(result.warnings || []).forEach(function (warning) { lines.push('提醒：' + (warning.message || warning.code)) })
+    return { title: '模板已做好', lines: lines, paths: [{ label: '模板', path: result.outputPath }] }
+  })
+}
+
+/**
+ * 整套备课：一节课要用的东西一次出齐（填了哪几栏就出哪几件）。
+ * 老师备课的真实顺序是先想"这节课上什么"，再分别去做出卷/听写/教案/课件 ——
+ * 四张卡各跑一次要开四次面板，这里合成一次，短板也不会互相拖累（一件失败只报一件）。
+ */
+function buildPack(draft, options) {
+  const title = String(draft.title || '').trim()
+  const paperText = String(draft.paperText || '').trim()
+  const bankPath = String(draft.bankSource || '').trim()
+  const wordsPath = String(draft.wordsSource || '').trim()
+  const planText = String(draft.planText || '').trim()
+  const deckText = String(draft.deckText || '').trim()
+  const jobs = []
+  const kinds = []
+
+  const add = function (kind, promise) {
+    kinds.push(kind)
+    jobs.push(promise)
+  }
+
+  if (paperText || bankPath) {
+    const shared = {
+      title: title || undefined,
+      baseTemplate: draft.template || undefined,
+      page: draft.template ? undefined : (PAPERS[draft.paper || '8K-2'] || PAPERS['8K-2']),
+      values: {
+        className: String(draft.className || '').trim() || undefined,
+        teacherName: String(draft.teacherName || '').trim() || undefined
+      },
+      options: {
+        minutes: draft.minutes ? Number(draft.minutes) : undefined,
+        answerCard: draft.card ? 'card' : 'none',
+        answerSheet: draft.answers ? 'end' : 'none'
+      }
+    }
+    add('试卷', (bankPath
+      ? engine('bank:build', Object.assign({ path: bankPath }, shared))
+      : engine('exam:build', Object.assign({ text: paperText }, shared))
+    ).then(function (result) { return { kind: '试卷', result: result } }))
+  }
+
+  if (wordsPath) {
+    add('听写单', engine('handout:build', {
+      source: wordsPath,
+      title: title ? title + ' 听写' : undefined,
+      mode: 'en2cn',
+      columns: 2
+    }).then(function (result) { return { kind: '听写单', result: result } }))
+  }
+
+  if (planText) {
+    add('教案', engine('plan:build', {
+      text: planText,
+      title: title || undefined,
+      teacher: String(draft.teacherName || '').trim() || undefined,
+      className: String(draft.className || '').trim() || undefined,
+      layout: 'form'
+    }).then(function (result) { return { kind: '教案', result: result } }))
+  }
+
+  if (deckText) {
+    const html = draft.format === 'html'
+    add('课件', engine(html ? 'lesson:html' : 'lesson:deck', {
+      text: deckText,
+      title: title || undefined,
+      template: html ? undefined : (draft.deckTemplate || undefined)
+    }).then(function (result) { return { kind: '课件', result: result } }))
+  }
+
+  if (!jobs.length) {
+    const empty = new Error('四栏都空着，没有东西可做')
+    empty.hint = '至少填一样：题库或题干（出卷）、词表文件（听写单）、教案草稿、课件内容'
+    return Promise.reject(empty)
+  }
+
+  // 一件失败不拖垮其他三件：各自 catch 成一行说明，别的照出
+  return Promise.all(jobs.map(function (promise, index) {
+    return promise.catch(function (failure) { return { kind: kinds[index], error: failure } })
+  })).then(function (outcomes) {
+    const lines = []
+    const paths = []
+    const exports = []
+    let previewPath = null
+    let previewPdf = null
+
+    outcomes.forEach(function (item) {
+      if (item.error) {
+        lines.push(item.kind + '没做成：' + ((item.error && item.error.message) || item.error))
+        return
+      }
+      const result = item.result || {}
+      const output = result.outputPath
+      if (item.kind === '试卷') {
+        lines.push('试卷：共 ' + result.questionCount + ' 题，合计 ' + result.totalScore + ' 分')
+        findingsLines(result.preflight).forEach(function (line) { lines.push('　' + line) })
+        paths.push({ label: '试卷（Word）', path: output })
+        const blocked = result.preflight && result.preflight.level === 'fail'
+        if (!blocked) exports.push({ label: '试卷 PDF', path: output })
+        else lines.push('　试卷 PDF 先不导：印前检查没通过（Word 已生成，改完再点「出试卷」导一次）')
+        if (!previewPath) previewPath = output
+      } else if (item.kind === '听写单') {
+        lines.push('听写单：共排进 ' + result.count + ' 条，' + (result.columns || 1) + ' 栏')
+        paths.push({ label: '听写单（Word）', path: output })
+        exports.push({ label: '听写单 PDF', path: output })
+      } else if (item.kind === '教案') {
+        lines.push('教案：认出了 ' + result.fieldCount + ' 个字段、' + ((result.sections || []).length) + ' 个教学环节')
+        paths.push({ label: '教案（Word）', path: output })
+        exports.push({ label: '教案 PDF', path: output })
+      } else {
+        const html = /\.html?$/i.test(output || '')
+        lines.push('课件：共 ' + result.slides + ' 页（' + (html ? '网页版，双击用浏览器打开，← → 翻页' : 'PowerPoint，还能接着改') + '）')
+        paths.push({ label: html ? '课件（html）' : '课件（pptx）', path: output })
+        if (!html) exports.push({ label: '课件 PDF', path: output })
+      }
+      ;(result.warnings || []).forEach(function (warning) {
+        lines.push('　' + item.kind + '提醒：' + (warning.message || warning.code))
+      })
+    })
+
+    // 一件一件导（别并发去抢 LibreOffice），上一个失败不影响下一个
+    const chain = exports.reduce(function (previous, target) {
+      return previous.then(function () {
+        return exportPdf(target.path).then(function (pdf) {
+          const pdfPath = pdf && pdf.ok && pdf.pdf ? pdf.pdf : null
+          if (pdfPath) {
+            paths.push({ label: target.label, path: pdfPath })
+            if (!previewPdf && target.path === previewPath) previewPdf = pdfPath
+            return
+          }
+          // 导不出 PDF 不影响 Word，但要看得到原因（以前这里静默吞掉，老师只看到少了几个按钮）
+          lines.push('　' + target.label + ' 没导出来：' + errorText(pdf && pdf.error))
+        }).catch(function (error) {
+          lines.push('　' + target.label + ' 没导出来：' + errorText(error))
+        })
+      })
+    }, Promise.resolve())
+
+    return chain.then(function () {
+      return renderPreview(previewPath, previewPdf).then(function (preview) {
+        return {
+          title: '整节课的东西都做好了',
+          lines: lines,
+          paths: paths,
+          preview: preview || undefined
+        }
+      })
+    })
+  })
+}
+
+function splitPaths(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map(function (line) { return line.trim() })
+    .filter(function (line) { return line !== '' })
+}
+
+/** 挑题：一行一种题型，「单项选择 10」「填空 3 题」都认；空行忽略。 */
+function parsePick(text) {
+  const pick = {}
+  splitPaths(text).forEach(function (line) {
+    const match = line.match(/^(.+?)[\s:：=]*?(\d+)\s*题?$/)
+    if (match) pick[match[1].trim()] = Number(match[2])
+  })
+  return Object.keys(pick).length ? pick : null
+}
+
+// 老师不想每次都重选学校模板、纸型、时长：把"常用设置"记在本机，下次打开自动带出来。
+// 只记选项类字段，题干、词表、路径清单这些一次性的内容不记（免得下次以为是自己填错的）。
+const STICKY_KEY = 'dsh-teacher-kit:sticky:v2'
+// 只记"选择类"的：模板、纸型、时长、栏数、版式…… 勾选框（附答题卡/附答案/A-B/教师卷）
+// 一律不记 —— 下次打开莫名多出一页答案，老师会以为点错了。
+const STICKY_FIELDS = [
+  'template', 'paper', 'minutes', 'mode', 'columns', 'layout', 'format',
+  'pause', 'repeat', 'className', 'teacherName', 'periods', 'font', 'action', 'fillLines',
+  'mergeHeaderMode'
+]
+
+function loadSticky() {
+  try {
+    const raw = globalThis.localStorage && globalThis.localStorage.getItem(STICKY_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (e) {
+    return {}
+  }
+}
+
+function saveSticky(map) {
+  try {
+    if (!globalThis.localStorage) return
+    const out = {}
+    Object.keys(map || {}).forEach(function (task) {
+      const source = map[task] || {}
+      const keep = {}
+      STICKY_FIELDS.forEach(function (key) {
+        if (source[key] !== undefined && source[key] !== '' && source[key] !== false) keep[key] = source[key]
+      })
+      if (Object.keys(keep).length) out[task] = keep
+    })
+    globalThis.localStorage.setItem(STICKY_KEY, JSON.stringify(out))
+  } catch (e) {
+    // 记不住就算了，不影响出卷
+  }
+}
+
+/** 文件加工：净化 / 批量净化 / 合并 / 提取 / 检查。 */
+function processFiles(draft) {
+  const action = draft.action || 'clean'
+  if (action === 'batch') {
+    // 一堆讲义一次性净化：一份一份来，坏的跳过并说清楚是哪份，别让一个坏文件毁掉整批。
+    const inputs = splitPaths(draft.source)
+    const done = []
+    const failed = []
+    let links = 0
+    let fonts = 0
+    let spacing = 0
+    let empty = 0
+    let step = Promise.resolve()
+    inputs.forEach(function (input) {
+      step = step.then(function () {
+        return engine('docx:clean', { path: input, options: { font: draft.font || '宋体' } }).then(function (result) {
+          const stats = result.stats || {}
+          done.push(input)
+          links += stats.links || 0
+          fonts += stats.fonts || 0
+          spacing += stats.spacing || 0
+          empty += stats.emptyParagraphs || 0
+        }).catch(function (failure) {
+          failed.push((input.split(/[\\/]/).pop() || input) + '：' + ((failure && failure.message) || '没跑通'))
+        })
+      })
+    })
+    return step.then(function () {
+      const lines = [
+        '净化 ' + done.length + ' 份，共拆超链接 ' + links + ' 个 · 统一字体 ' + fonts + ' 处 · 清段落间距 ' + spacing + ' 段 · 删空段 ' + empty + ' 个'
+      ]
+      if (done.length) lines.push('原文件都没动，净化后的副本在旁边（文件名带「_净化后」）')
+      if (failed.length) {
+        lines.push('这 ' + failed.length + ' 份没动：')
+        failed.slice(0, 5).forEach(function (item) { lines.push('· ' + item) })
+      }
+      // 「打开文件夹」得给目录：输入里没有分隔符（相对文件名）时别把文件自己当目录（审查 C-15）。
+      const folder = done.length ? String(done[0]).replace(/[\\/][^\\/]*$/, '') : ''
+      const dirPath = folder && folder !== done[0] ? folder : ''
+      return { title: '批量净化完成', lines: lines, paths: dirPath ? [{ label: '文件夹', path: dirPath }] : [] }
+    })
+  }
+  if (action === 'check') {
+    return engine('preflight', { path: draft.source }).then(function (result) {
+      const lines = findingsLines(result)
+      const facts = result.facts || {}
+      if (facts.score && facts.score.declared) {
+        lines.push('卷子上写的满分 ' + facts.score.declared + ' 分，实际能数出 ' + (facts.score.sum || 0) + ' 分')
+      }
+      if (!(result.findings || []).length) lines.push('没挑出毛病，可以直接印')
+      return { title: '检查完了', lines: lines, paths: [] }
+    })
+  }
+  if (action === 'clean') {
+    return engine('docx:clean', { path: draft.source, options: { font: draft.font || '宋体' } }).then(function (result) {
+      const stats = result.stats || {}
+      const lines = [
+        '拆掉超链接 ' + (stats.links || 0) + ' 个 · 去色 ' + (stats.colors || 0) + ' 处 · 统一字体 ' + (stats.fonts || 0) + ' 处',
+        '删空段 ' + (stats.emptyParagraphs || 0) + ' 个 · 段落间距清零 ' + (stats.spacing || 0) + ' 段'
+      ]
+      ;(result.warnings || []).forEach(function (warning) { lines.push('提醒：' + (warning.message || warning.code)) })
+      if (result.note) lines.push(result.note)
+      else if (!result.overwritten) lines.push('原文件没动，净化后的副本就在旁边')
+      const paths = [{ label: 'Word', path: result.outputPath }]
+      if (result.backup) paths.push({ label: '原件备份', path: result.backup })
+      return { title: '已净化', lines: lines, paths: paths }
+    })
+  }
+  if (action === 'merge') {
+    const inputs = splitPaths(draft.source)
+    return engine('docx:merge', {
+      inputs: inputs,
+      mergeHeaderMode: draft.mergeHeaderMode || 'first'
+    }).then(function (result) {
+      const lines = ['合并 ' + (result.inputs || []).length + ' 份，搬过去 ' + (result.images || 0) + ' 张图片']
+      if (result.headersMode === 'each') {
+        lines.push('每份都保留了自己的页眉页脚（' + (result.headerSections || 0) + ' 节带抬头，页码接着往下数）')
+      } else if (result.headersInherited) {
+        lines.push('沿用了第一份的页眉页脚（学校抬头、页码都在）')
+      }
+      ;(result.warnings || []).forEach(function (warning) { lines.push('提醒：' + (warning.message || warning.code)) })
+      return { title: '已合并', lines: lines, paths: [{ label: 'Word', path: result.outputPath }] }
+    })
+  }
+  return engine('docx:extract', { path: draft.source }).then(function (result) {
+    return {
+      title: '已提取',
+      lines: ['正文 ' + result.paragraphCount + ' 段 · 表格 ' + (result.tables || []).length + ' 个', (result.text || '').slice(0, 240)],
+      paths: []
+    }
+  })
+}
+
+function ResultCard(props) {
+  const { result, onReveal } = props
+  const im = React.useState(null)
+  const image = im[0]
+  const setImage = im[1]
+  // 预览图是异步 fetch 的（要带头拿 bytes），所以放 effect 里；换了 result 就重取。
+  // 两件事都不能省：换结果先清掉上一张图（否则新标题配旧图，老师以为卷子印错了）；
+  // cleanup 里 revoke blob（一张整页 PNG 几百 KB–几 MB，连出几份卷子就一直挂着）。
+  React.useEffect(function () {
+    const first = result && result.preview && result.preview.first
+    let alive = true
+    let url = null
+    if (!first) {
+      setImage(null)
+      return function () { alive = false }
+    }
+    setImage(null)
+    loadImageUrl(first).then(function (value) {
+      if (!alive) {
+        if (value && typeof URL !== 'undefined' && URL.revokeObjectURL) {
+          try { URL.revokeObjectURL(value) } catch { /* 已释放 */ }
+        }
+        return
+      }
+      url = value
+      setImage(value)
+    })
+    return function () {
+      alive = false
+      if (url && typeof URL !== 'undefined' && URL.revokeObjectURL) {
+        try { URL.revokeObjectURL(url) } catch { /* 已释放 */ }
+      }
+    }
+  }, [result])
+  if (!result) return null
+  return h(
+    'div',
+    { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '6px', paddingTop: '8px', borderTop: '1px solid ' + COLORS.border } },
+    h(
+      'div',
+      { style: { display: 'flex', alignItems: 'baseline', gap: '8px', justifyContent: 'space-between' } },
+      h('span', { style: { fontSize: '13px', fontWeight: 600 } }, '✓ ' + result.title),
+      result.elapsedSec ? h('span', { style: { fontSize: '11px', color: COLORS.muted } }, '用了 ' + result.elapsedSec + ' 秒') : null
+    ),
+    h(
+      'div',
+      { style: { display: 'flex', flexDirection: 'column', gap: '2px' } },
+      (result.lines || []).map(function (line, index) {
+        return h('span', { key: 'line-' + index, style: { fontSize: '12px', color: COLORS.muted, lineHeight: 1.6 } }, line)
+      })
+    ),
+    result.preview
+      ? h(
+          'div',
+          { style: { display: 'flex', gap: '10px', alignItems: 'flex-start', flexWrap: 'wrap' } },
+          image
+            ? h('img', {
+                src: image,
+                alt: '第一页预览',
+                style: {
+                  maxWidth: '100%',
+                  maxHeight: '260px',
+                  border: '1px solid ' + COLORS.border,
+                  borderRadius: '6px',
+                  background: '#fff'
+                }
+              })
+            : h('span', { style: { fontSize: '11px', color: COLORS.muted } }, '预览生成中…'),
+          h('span', { style: { fontSize: '11px', color: COLORS.muted, lineHeight: 1.6 } },
+            '共 ' + result.preview.pageCount + ' 页 · 这是第一页，和导出的 PDF/打印出来的一样')
+        )
+      : null,
+    h(
+      'div',
+      { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' } },
+      (result.paths || []).map(function (item) {
+        return h(
+          'button',
+          {
+            key: item.label,
+            type: 'button',
+            style: TRIGGER,
+            title: item.path,
+            onClick: function () { onReveal(item.path) }
+          },
+          '打开「' + item.label + '」所在文件夹'
+        )
+      })
+    )
+  )
+}
+
+const PICKER = {
+  flexBasis: '100%',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '5px',
+  padding: '8px 10px',
+  borderRadius: '9px',
+  border: '1px solid ' + COLORS.border,
+  // 固定高度 + 不许被父级 flex 压缩：否则面板一长，选择器会被挤成一条缝
+  height: '230px',
+  flexShrink: 0,
+  overflowY: 'auto'
+}
+
+const PICK_ROW = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '8px',
+  width: '100%',
+  padding: '3px 6px',
+  borderRadius: '6px',
+  border: '1px solid transparent',
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '12px',
+  textAlign: 'left',
+  cursor: 'pointer'
+}
+
+function humanSize(bytes) {
+  if (!bytes) return ''
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB'
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+/**
+ * 上次选文件停在哪个目录：老师的卷子几乎都在同一个文件夹（桌面 / 教学资料 / 一个 U 盘），
+ * 每次都从「文档」重新点进去太烦（审查 C-16）。
+ */
+const LAST_DIR_KEY = 'dsh-teacher-kit:last-dir'
+function loadLastDir() {
+  try {
+    return (globalThis.localStorage && globalThis.localStorage.getItem(LAST_DIR_KEY)) || ''
+  } catch (e) {
+    return ''
+  }
+}
+function saveLastDir(dir) {
+  try {
+    if (dir && globalThis.localStorage) globalThis.localStorage.setItem(LAST_DIR_KEY, String(dir))
+  } catch (e) {
+    // 记不住就还是从默认目录开始，不影响选文件
+  }
+}
+
+/**
+ * 文件选择器：老师不知道"绝对路径"是什么，但他会点文件夹。
+ * 只读一层的目录列表（宿主 /list-dir），点目录进去、点文件选中。
+ */
+function FilePicker(props) {
+  const { kinds, startDir, onPick, onCancel } = props
+  const st = React.useState({ dir: startDir || '', entries: [], quick: [], parent: null, loading: true, error: null })
+  const view = st[0]
+  const setView = st[1]
+  // 慢盘上连点两个文件夹时，后到的旧响应会把新目录覆盖掉（标题是 A、列表是 B）。
+  // 用请求序号 + 活着标记把过期响应全部丢掉。
+  const seqRef = React.useRef ? React.useRef(0) : null
+  const aliveRef = React.useRef ? React.useRef(true) : null
+  React.useEffect(function () {
+    if (aliveRef) aliveRef.current = true
+    return function () { if (aliveRef) aliveRef.current = false }
+  }, [])
+  const load = function (dir) {
+    if (seqRef) seqRef.current += 1
+    const mine = seqRef ? seqRef.current : 0
+    const usable = function () { return (!seqRef || seqRef.current === mine) && (!aliveRef || aliveRef.current) }
+    // 函数式更新：别读闭包里的旧 view（连点时会拿着上一个目录的状态写回去）
+    setView(function (prev) {
+      return Object.assign({}, prev, { entries: [], loading: true, error: null })
+    })
+    listDir(dir, kinds)
+      .then(function (value) {
+        if (!usable()) return
+        if (value && value.ok) {
+          saveLastDir(value.dir)
+          setView({ dir: value.dir, entries: value.entries || [], quick: value.quick || [], parent: value.parent, loading: false, error: null })
+        } else {
+          // 宿主回包的错误是 {code, message, hint}，直接塞进 <span> 会把 React 弄崩
+          const problem = value && value.error
+          const text = typeof problem === 'string'
+            ? problem
+            : (problem && (problem.message || problem.code)) || '这个文件夹打不开'
+          setView(function (prev) { return Object.assign({}, prev, { entries: [], loading: false, error: text }) })
+        }
+      })
+      .catch(function (failure) {
+        if (!usable()) return
+        setView(function (prev) {
+          return Object.assign({}, prev, { entries: [], loading: false, error: (failure && failure.message) || '连不上本地文件服务' })
+        })
+      })
+  }
+  React.useEffect(function () { load(startDir) }, [])
+
+  const rows = []
+  if (view.parent) {
+    rows.push(h('button', { key: 'up', type: 'button', style: PICK_ROW, onClick: function () { load(view.parent) } }, '↑ 上一级'))
+  }
+  ;(view.entries || []).forEach(function (entry) {
+    rows.push(
+      h(
+        'button',
+        {
+          key: entry.path,
+          type: 'button',
+          style: PICK_ROW,
+          title: entry.path,
+          onClick: function () { if (entry.dir) load(entry.path); else onPick(entry.path) }
+        },
+        h('span', { style: { width: '16px', textAlign: 'center' } }, entry.dir ? '📁' : '📄'),
+        h('span', { style: { flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, entry.name),
+        entry.dir
+          ? null
+          : h('span', { style: { fontSize: '11px', color: COLORS.muted, flex: '0 0 auto' } }, humanSize(entry.size))
+      )
+    )
+  })
+
+  return h(
+    'div',
+    { style: PICKER },
+    h(
+      'div',
+      { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+      h('span', { style: { fontSize: '12px', fontWeight: 600 } }, '选一个文件'),
+      h('span', { style: { fontSize: '11px', color: COLORS.muted, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: view.dir }, view.dir || '正在打开…'),
+      h('button', { type: 'button', style: Object.assign({}, TRIGGER, { height: '22px', padding: '0 8px' }), onClick: onCancel }, '取消')
+    ),
+    (view.quick || []).length
+      ? h(
+          'div',
+          { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+          (view.quick || []).map(function (place) {
+            return h('button', { key: place.path, type: 'button', style: Object.assign({}, TRIGGER, { height: '22px', padding: '0 8px' }), onClick: function () { load(place.path) } }, place.label)
+          })
+        )
+      : null,
+    view.loading ? h('span', { style: { fontSize: '11px', color: COLORS.muted } }, '正在打开…') : null,
+    view.error ? h('span', { style: { fontSize: '12px', color: COLORS.bad } }, '打不开：' + view.error) : null,
+    view.loading || view.error ? null : h('div', { style: { display: 'flex', flexDirection: 'column', gap: '1px' } }, rows.length ? rows : h('span', { style: { fontSize: '11px', color: COLORS.muted } }, '这个文件夹里没有能选的文件'))
+  )
+}
+
+/* ── v0.16 面板外观 ───────────────────────────────────────────────────────
+ * 一份注入式 <style>（只作用于 .tk-* 自己的类），令牌跟随系统浅色/深色。
+ * 为什么不用内联 style 堆：hover / focus-visible / 媒体查询 / 动画这些内联写不了，
+ * 而老师的显示器从 1366×768 到 2K、从白天到夜里，都是要照顾的。
+ */
+const PANEL_CSS = [
+  '.tk-backdrop{position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(15,23,42,.42)}',
+  '.tk-panel{--tk-bg:#ffffff;--tk-fg:#111827;--tk-muted:#6b7280;--tk-line:rgba(17,24,39,.10);--tk-tint:rgba(17,24,39,.045);--tk-accent:#2563eb;--tk-accent-soft:rgba(37,99,235,.10);--tk-ok:#15803d;--tk-bad:#b91c1c;--tk-shadow:0 26px 64px rgba(15,23,42,.26);',
+  'position:relative;display:flex;flex-direction:column;box-sizing:border-box;width:min(720px,100%);max-height:min(86vh,760px);overflow:hidden;border-radius:16px;border:1px solid var(--tk-line);background:var(--tk-bg);color:var(--tk-fg);box-shadow:var(--tk-shadow);font:inherit;font-size:13px;line-height:1.5;text-align:left}',
+  '.tk-panel *,.tk-panel *::before,.tk-panel *::after{box-sizing:border-box}',
+  '.tk-panel:focus{outline:none}',
+  '.tk-body::-webkit-scrollbar{width:10px}',
+  '.tk-body::-webkit-scrollbar-thumb{background:var(--tk-line);border-radius:99px;border:3px solid transparent;background-clip:content-box}',
+  '@media (prefers-color-scheme:dark){.tk-panel{--tk-bg:#191a1e;--tk-fg:#eceef2;--tk-muted:#9aa1ac;--tk-line:rgba(255,255,255,.14);--tk-tint:rgba(255,255,255,.06);--tk-accent:#8ab0ff;--tk-accent-soft:rgba(138,176,255,.16);--tk-ok:#4ade80;--tk-bad:#f87171;--tk-shadow:0 26px 64px rgba(0,0,0,.62)}}',
+  '[data-theme="dark"] .tk-panel,html.dark .tk-panel,.dark .tk-panel{--tk-bg:#191a1e;--tk-fg:#eceef2;--tk-muted:#9aa1ac;--tk-line:rgba(255,255,255,.14);--tk-tint:rgba(255,255,255,.06);--tk-accent:#8ab0ff;--tk-accent-soft:rgba(138,176,255,.16);--tk-ok:#4ade80;--tk-bad:#f87171;--tk-shadow:0 26px 64px rgba(0,0,0,.62)}',
+  '.tk-head{display:flex;align-items:center;gap:10px;min-height:28px;flex:0 0 auto;padding:16px 20px 12px}',
+  '.tk-body{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:0 20px 14px}',
+  '.tk-head-icon{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:9px;background:var(--tk-accent-soft);color:var(--tk-accent)}',
+  '.tk-title{font-size:14px;font-weight:650;letter-spacing:.01em;white-space:nowrap}',
+  '.tk-sub{font-size:11.5px;color:var(--tk-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.tk-x{margin-left:auto;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:8px;border:1px solid transparent;background:transparent;color:var(--tk-muted);font:inherit;font-size:15px;line-height:1;cursor:pointer}',
+  '.tk-x:hover{background:var(--tk-tint);color:var(--tk-fg);border-color:var(--tk-line)}',
+  '.tk-x:focus-visible{outline:2px solid var(--tk-accent);outline-offset:2px}',
+  '.tk-profile{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 12px;border-radius:12px;border:1px solid var(--tk-line);background:var(--tk-tint)}',
+  '.tk-profile-empty{font-size:12px;color:var(--tk-muted)}',
+  '.tk-chips{display:flex;flex-wrap:wrap;gap:6px;min-width:0;flex:1}',
+  '.tk-chip{display:inline-flex;align-items:baseline;gap:5px;max-width:230px;padding:3px 9px;border-radius:999px;border:1px solid var(--tk-line);background:var(--tk-bg);font-size:11.5px;line-height:1.45;overflow:hidden;white-space:nowrap}',
+  '.tk-chip-key{color:var(--tk-muted);flex:0 0 auto}',
+  '.tk-chip-val{overflow:hidden;text-overflow:ellipsis;font-weight:550}',
+  '.tk-ghost{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:8px;border:1px solid var(--tk-line);background:var(--tk-bg);color:var(--tk-fg);font:inherit;font-size:11.5px;line-height:1;cursor:pointer;white-space:nowrap}',
+  '.tk-ghost:hover{background:var(--tk-tint)}',
+  '.tk-ghost:focus-visible{outline:2px solid var(--tk-accent);outline-offset:2px}',
+  '.tk-ghost[disabled]{opacity:.55;cursor:default}',
+  '.tk-group{display:flex;flex-direction:column;gap:1px}',
+  '.tk-group-title{padding:4px 12px 3px;font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--tk-muted)}',
+  '.tk-row{display:flex;align-items:center;gap:11px;width:100%;padding:8px 12px;border-radius:10px;border:1px solid transparent;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:background .14s ease,border-color .14s ease}',
+  '.tk-row:hover{background:var(--tk-tint);border-color:var(--tk-line)}',
+  '.tk-row:active{background:var(--tk-accent-soft)}',
+  '.tk-row:focus-visible{outline:2px solid var(--tk-accent);outline-offset:2px}',
+  '.tk-row[disabled]{opacity:.5;cursor:default}',
+  '.tk-row-icon{display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;width:30px;height:30px;border-radius:9px;background:var(--tk-accent-soft);color:var(--tk-accent)}',
+  '.tk-row-main{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1 1 auto}',
+  '.tk-row-label{font-size:13px;font-weight:600;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.tk-row-brief{font-size:11.5px;color:var(--tk-muted);line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.tk-chev{flex:0 0 auto;color:var(--tk-muted);opacity:.65;display:inline-flex}',
+  '.tk-foot{display:flex;align-items:center;gap:10px;flex:0 0 auto;padding:10px 20px 13px;border-top:1px solid var(--tk-line);font-size:11.5px;color:var(--tk-muted);background:var(--tk-bg)}',
+  '.tk-note{margin:0;font-size:12px;line-height:1.6}',
+  '.tk-note-ok{color:var(--tk-ok)}',
+  '.tk-note-bad{color:var(--tk-bad)}',
+  '.tk-old{margin-top:2px}',
+  '.tk-old-toggle{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:var(--tk-muted);font:inherit;font-size:11.5px;cursor:pointer;padding:2px 0}',
+  '.tk-old-toggle:hover{color:var(--tk-fg)}',
+  '.tk-old-toggle:focus-visible{outline:2px solid var(--tk-accent);outline-offset:2px;border-radius:6px}',
+  '.tk-spin{display:inline-block;width:11px;height:11px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:tk-rot .7s linear infinite;vertical-align:-1px}',
+  '@keyframes tk-rot{to{transform:rotate(360deg)}}',
+  '@media (prefers-reduced-motion:reduce){.tk-spin{animation-duration:2.4s}.tk-row{transition:none}}',
+  '@media (max-width:560px){.tk-backdrop{padding:0;align-items:flex-end}.tk-panel{width:100%;max-height:92vh;border-radius:18px 18px 0 0}.tk-head{padding:14px 14px 10px}.tk-body{padding:0 12px 10px;gap:8px}.tk-foot{padding:10px 14px 12px}.tk-row{padding:10px}.tk-row-brief{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.tk-sub{display:none}}',
+  // 宽屏两列：十件事一屏放得下，不用滚；窄屏仍是一列。
+  '@media (min-width:640px){.tk-group{display:grid;grid-template-columns:1fr 1fr;column-gap:10px;row-gap:1px}.tk-group-title{grid-column:1/-1}}',
+  '@media (max-height:520px){.tk-backdrop{padding:8px}.tk-panel{max-height:96vh}}'
+].join('\n')
+
+const TASK_GROUPS = [
+  { title: '出卷与练习', keys: ['exam', 'bank', 'dictation'] },
+  { title: '上课用', keys: ['plan', 'deck', 'pack'] },
+  { title: '学校事务', keys: ['files', 'wechat', 'docflow'] }
+]
+
+/* 图标只用 stroke，路径都按 24×24 画：17px 下仍然看得清，也不用引外部资源。 */
+const ICON_PATHS = {
+  exam: ['M8 3h6l5 5v13H8z', 'M14 3v5h5', 'M11 12h6', 'M11 16h6'],
+  bank: ['M12 3.5l8 4-8 4-8-4z', 'M4 12l8 4 8-4', 'M4 16.5l8 4 8-4'],
+  dictation: ['M4 6h10', 'M4 11h7', 'M4 16h9', 'M17.4 15.6l2.8-2.8 2 2-2.8 2.8z'],
+  plan: ['M5 4h9l5 5v11H5z', 'M14 4v5h5', 'M9 13h6', 'M9 16.5h4'],
+  deck: ['M3.5 5.5h17v10h-17z', 'M12 15.5V19', 'M8.5 21h7', 'M10.5 9.5l3.5 2-3.5 2z'],
+  pack: ['M4 4h7v7H4z', 'M13 4h7v7h-7z', 'M4 13h7v7H4z', 'M13 13h7v7h-7z'],
+  files: ['M3 7.5h6l1.6 2H21V19H3z', 'M3 7.5V5h5l1.6 2'],
+  wechat: ['M4 9.5l12-4.2v13.4L4 14.5z', 'M17.6 9.9h2.1v4.2h-2.1'],
+  docflow: ['M7 4h10v5H7z', 'M5 9.5h14v10.5H5z', 'M9 13.5h6', 'M9 17h4'],
+  profile: ['M12 9.2a3.1 3.1 0 100-6.2 3.1 3.1 0 000 6.2z', 'M4.5 20.6c0-4.2 3.4-6.5 7.5-6.5s7.5 2.3 7.5 6.5'],
+  default: ['M6 4h9l4 4v12H6z', 'M15 4v4h4']
+}
+
+function TaskIcon(props) {
+  const name = (props && props.name) || 'default'
+  const paths = ICON_PATHS[name] || ICON_PATHS.default
+  return h(
+    'span',
+    { className: 'tk-row-icon', 'aria-hidden': 'true' },
+    h(
+      'svg',
+      { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      paths.map(function (d, index) { return h('path', { key: 'p' + index, d: d }) })
+    )
+  )
+}
+
+function Chevron() {
+  return h(
+    'span',
+    { className: 'tk-chev', 'aria-hidden': 'true' },
+    h('svg', { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      h('path', { d: 'M9 5l7 7-7 7' }))
+  )
+}
+
+/* 画像里存的是分节键值（school.name / paper.key …），面板只挑认识的翻成人话。 */
+const CHIP_LABELS = {
+  'school.name': '学校',
+  'school.stage': '学段',
+  'school.subject': '学科',
+  'school.grades': '年级',
+  'school.teacher': '署名',
+  'paper.key': '卷面',
+  'paper.size': '纸型',
+  'paper.footer': '页脚',
+  'paper.columns': '分栏',
+  'plan.layout': '教案版式',
+  'deck.theme': '课件风格',
+  'deck.titleSizePt': '标题字号',
+  'deck.bodySizePt': '正文字号',
+  'wechat.tone': '推文语气',
+  'wechat.signature': '落款',
+  'docflow.unit': '公文单位',
+  'docflow.dept': '科室'
+}
+
+const CHIP_ORDER = ['school', 'paper', 'plan', 'deck', 'wechat', 'docflow']
+const CHIP_LIMIT = 6
+
+/** 把画像摊成几个小标签：学校在前，纸型/版式在后，最多 6 个（再多就不是"一眼看完"了）。 */
+function profileChips(fields) {
+  const out = []
+  const sections = fields && typeof fields === 'object' ? fields : {}
+  for (let s = 0; s < CHIP_ORDER.length; s += 1) {
+    const name = CHIP_ORDER[s]
+    const section = sections[name]
+    if (!section || typeof section !== 'object') continue
+    const keys = Object.keys(section)
+    for (let i = 0; i < keys.length; i += 1) {
+      const value = section[keys[i]]
+      if (value === null || value === undefined) continue
+      const label = CHIP_LABELS[name + '.' + keys[i]]
+      // 认不出的键不硬塞进面板（会冒出 orientation / landscape 这种半截英文，老师看不懂）。
+      if (!label) continue
+      let text = Array.isArray(value) ? value.join('、') : String(value).trim()
+      if (!text || typeof value === 'object') continue
+      // 页脚是「使用班级：{{className}} …」这种模板串，占位符对老师等于乱码，换成一句话说清效果。
+      if (name + '.' + keys[i] === 'paper.footer') text = '按学校模板自动填'
+      out.push({ key: name + '.' + keys[i], label: label, value: text })
+      if (out.length >= CHIP_LIMIT) return out
+    }
+  }
+  return out
+}
+
+function TeacherKit(props) {
+  const locked = Boolean(props && props.locked)
+  const sessionId = props && props.sessionId
+  const setOpen = React.useState(false)
+  const open = setOpen[0]
+  const changeOpen = setOpen[1]
+  const sel = React.useState(null)
+  const selected = sel[0]
+  const setSelected = sel[1]
+  const st = React.useState(null)
+  const status = st[0]
+  const setStatus = st[1]
+  // 每张卡各记各的：切到「教案」不该看到「出试卷」的卷子名称和题干（真机抓到过）。
+  const dr = React.useState({})
+  const draftMap = dr[0]
+  const setDraftMap = dr[1]
+  const draft = (selected && draftMap[selected]) || {}
+  // 每个字都 stringify + 写 localStorage 会把长题干卡成幻灯片（审查 C-12）：攒 400ms 再写，
+  // 面板收起或组件卸载时立刻补一次，免得刚敲完就关掉丢掉。
+  const draftMapRef = React.useRef(draftMap)
+  draftMapRef.current = draftMap
+  const stickyTimer = React.useRef(null)
+  const flushSticky = function () {
+    if (stickyTimer.current && typeof clearTimeout === 'function') clearTimeout(stickyTimer.current)
+    stickyTimer.current = null
+    saveSticky(draftMapRef.current || {})
+  }
+  const saveSoon = function (map) {
+    if (typeof setTimeout !== 'function') { saveSticky(map); return }
+    if (stickyTimer.current && typeof clearTimeout === 'function') clearTimeout(stickyTimer.current)
+    stickyTimer.current = setTimeout(function () {
+      stickyTimer.current = null
+      saveSticky(draftMapRef.current || map)
+    }, 400)
+  }
+  React.useEffect(function () {
+    return function () {
+      if (stickyTimer.current && typeof clearTimeout === 'function') clearTimeout(stickyTimer.current)
+      stickyTimer.current = null
+      // 卸载时把最后一份草稿写下去（切会话、收起面板都会走这里）
+      try { saveSticky(draftMapRef.current || {}) } catch (e) { /* 记不住不影响出卷 */ }
+    }
+  }, [])
+  const setDraft = function (next) {
+    if (!selected) return
+    const merged = Object.assign({}, draftMap)
+    merged[selected] = next
+    setDraftMap(merged)
+    saveSoon(merged)
+  }
+  // 打开面板时把上次的模板/纸型/时长带出来（换会话也不清，这是本机偏好不是会话内容）
+  React.useEffect(function () {
+    const saved = loadSticky()
+    if (Object.keys(saved).length) setDraftMap(Object.assign({}, saved))
+  }, [])
+  const bs = React.useState(false)
+  const busy = bs[0]
+  const setBusy = bs[1]
+  const er = React.useState(null)
+  const error = er[0]
+  const setError = er[1]
+  const rs = React.useState(null)
+  const result = rs[0]
+  const setResult = rs[1]
+  // 题库里有什么：点「看看题库里有什么」后把题型分布写在表单里（不弹结果卡，老师还在挑题）
+  const bk = React.useState(null)
+  const bankInfo = bk[0]
+  const setBankInfo = bk[1]
+  // 文件选择器：{key, kinds, append} —— 点"浏览…"时打开，选完写回 draft[key]
+  const bw = React.useState(null)
+  const browse = bw[0]
+  const setBrowse = bw[1]
+  // v0.15：面板默认不再是一张表单，而是"点一件事 → 在对话里被一步步问清楚"。
+  // gd = { tasks, profile }（来自宿主 /profile，老师点开面板时拉一次）
+  const gd = React.useState(null)
+  const guideInfo = gd[0]
+  const setGuideInfo = gd[1]
+  // ln = 最近一次"放进对话"的结果：{ task, ok, text, hint }
+  const ln = React.useState(null)
+  const launched = ln[0]
+  const setLaunched = ln[1]
+  const lb = React.useState(null)
+  const launching = lb[0]
+  const setLaunching = lb[1]
+  // 老方式（直接填表出成品）折在下面，默认不展开 —— 不是删掉，是让位给对话
+  const om = React.useState(false)
+  const oldMode = om[0]
+  const setOldMode = om[1]
+  // 面板节点：打开时把焦点放进来，Tab 不跑到背后的对话框里（v0.16 无障碍）。
+  const panelRef = React.useRef ? React.useRef(null) : null
+
+  // 打开面板就拉一次画像 + 任务清单：老师看到的第一个东西应该是"我学校已经记住了什么"
+  React.useEffect(function () {
+    if (!open) return undefined
+    let alive = true
+    // 每次重新打开都清掉上次那条「已放进对话」的回执，否则老师会以为刚点过。
+    setLaunched(null)
+    api('/profile')
+      .then(function (r) { return r.ok ? readJson(r) : null })
+      .then(function (value) { if (alive && value && value.ok) setGuideInfo(value) })
+      .catch(function () { /* 画像拉不到不影响点任务：还有本地兜底清单 */ })
+    return function () { alive = false }
+  }, [open])
+
+  // 点一个任务 = 往当前会话里投一条"老师口吻"的请求，然后什么都别在面板里问。
+  // 在途请求的"代"：切会话 / 再点一次就作废上一代，旧响应回来什么都不许改
+  // （否则 A 班点的出卷会把「✓ 试卷已生成」和 A 班的本地路径落到 B 班的面板上）。
+  const runSeq = React.useRef ? React.useRef(0) : null
+  const stale = function (mine, mySession) {
+    if (runSeq && runSeq.current !== mine) return true
+    if (sessionRef && sessionRef.current !== undefined && sessionRef.current !== mySession) return true
+    return false
+  }
+
+  const launchTask = function (taskKey) {
+    if (launching) return
+    if (!sessionId) {
+      setLaunched({ task: taskKey, ok: false, text: '', hint: '还没拿到会话号，刷新页面再试' })
+      return
+    }
+    if (runSeq) runSeq.current += 1
+    const mine = runSeq ? runSeq.current : 0
+    const mySession = sessionId
+    setLaunching(taskKey)
+    setError(null)
+    setResult(null)
+    api('/launch', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ task: taskKey, sessionId: sessionId })
+    })
+      .then(function (r) { return readJson(r) })
+      .then(function (value) {
+        if (stale(mine, mySession)) return
+        setLaunched({
+          task: taskKey,
+          ok: !!(value && value.ok),
+          text: (value && value.text) || '',
+          hint: (value && (value.hint || value.error)) || ''
+        })
+      })
+      .catch(function (failure) {
+        if (stale(mine, mySession)) return
+        setLaunched({ task: taskKey, ok: false, text: '', hint: (failure && failure.message) || '没能开始对话' })
+      })
+      .then(function () { if (!stale(mine, mySession)) setLaunching(null) })
+  }
+
+  // 「复制这段话」：剪贴板可能被拒（非安全上下文 / iframe 沙箱 / 用户拒绝权限）。
+  // 失败必须说出来，别让老师把空内容粘进输入框。
+  const [copyState, setCopyState] = React.useState(null)
+  const copyGuide = function (text) {
+    const done = function (ok) { setCopyState(ok ? 'copied' : 'manual') }
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(String(text || '')).then(
+          function () { done(true) },
+          function () { done(false) }
+        )
+        return
+      }
+    } catch { /* 落到下面的 manual 分支 */ }
+    done(false)
+  }
+
+  const changeField = function (key, value) {
+    const next = Object.assign({}, draft)
+    next[key] = value
+    setDraft(next)
+  }
+
+  // 挑题之前先看清题库里有什么：直接问引擎读一遍，结果写在表单里，不打断老师。
+  const inspectBank = function () {
+    if (!draft.source) {
+      setBankInfo({ error: '先选题库文件（点「浏览…」）' })
+      return
+    }
+    setBusy(true)
+    setBankInfo({ loading: true })
+    engine('bank:inspect', { path: draft.source })
+      .then(function (info) {
+        const parts = (info.types || []).map(function (item) {
+          const scores = (item.scores || []).length === 1 ? '（每题 ' + item.scores[0] + ' 分）' : ''
+          return item.type + ' ' + item.count + ' 题' + scores
+        })
+        setBankInfo({ text: '题库里一共 ' + info.count + ' 题：' + parts.join(' · ') })
+      })
+      .catch(function (e) {
+        setBankInfo({ error: (e && e.message) || '这个题库读不出题型' })
+      })
+      .then(function () { setBusy(false) })
+  }
+
+  // Esc 收起面板（对话框的常规手感）。
+  React.useEffect(() => {
+    if (!open) return
+    const onKey = function (event) {
+      if (event && (event.key === 'Escape' || event.key === 'Esc')) changeOpen(false)
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('keydown', onKey)
+    return function () {
+      if (typeof window !== 'undefined' && window.removeEventListener) window.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  // 投递成功后面板自己收起：老师要的东西已经在对话里了，面板再挡着就是碍事。
+  React.useEffect(function () {
+    if (!launched || !launched.ok) return undefined
+    if (typeof setTimeout !== 'function') return undefined
+    const timer = setTimeout(function () { changeOpen(false) }, 1200)
+    return function () { if (typeof clearTimeout === 'function') clearTimeout(timer) }
+  }, [launched])
+
+  // 打开时焦点落在第一件事上；Tab 只在面板里转（背后是对话输入框，不该被穿过去）。
+  React.useEffect(function () {
+    if (!open) return undefined
+    const node = panelRef && panelRef.current
+    if (!node) return undefined
+    const focusables = function () {
+      return Array.prototype.slice.call(
+        node.querySelectorAll('button:not([disabled]),textarea,input,a[href],[tabindex]:not([tabindex="-1"])')
+      )
+    }
+    // 焦点落在面板本身：键盘用户 Tab 立刻能走到第一件事，鼠标用户也不会看到一圈焦点框套在 ✕ 上。
+    if (node.focus) node.focus()
+    const onKey = function (event) {
+      if (!event || event.key !== 'Tab') return
+      const items = focusables()
+      if (!items.length) return
+      const head = items[0]
+      const tail = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === head) {
+        event.preventDefault()
+        tail.focus()
+      } else if (!event.shiftKey && document.activeElement === tail) {
+        event.preventDefault()
+        head.focus()
+      }
+    }
+    node.addEventListener('keydown', onKey)
+    return function () { node.removeEventListener('keydown', onKey) }
+  }, [open])
+
+  // 切会话：面板必须跟着收起（不然老师在 A 班的面板里改，结果落到 B 班会话上）。
+  // 但"会话号第一次注入"（undefined → 's1'）不是切换，不能把已经打开的面板关掉。
+  const sessionRef = React.useRef ? React.useRef(sessionId) : null
+  React.useEffect(() => {
+    if (sessionRef) {
+      const previous = sessionRef.current
+      sessionRef.current = sessionId
+      if (previous === undefined || previous === sessionId) return
+    }
+    // 在途请求作废 + 把按钮解锁：旧请求永不返回时不能让新会话的按钮一直灰着
+    if (runSeq) runSeq.current += 1
+    setBusy(false)
+    setLaunching(null)
+    changeOpen(false)
+    setSelected(null)
+    setDraftMap({})
+    setResult(null)
+    setError(null)
+    setBankInfo(null)
+  }, [sessionId])
+
+  React.useEffect(() => {
+    if (!open || status) return
+    let alive = true
+    api('/status')
+      .then((r) => (r.ok ? readJson(r) : { error: 'HTTP ' + r.status }))
+      .then((v) => { if (alive) setStatus(v) })
+      .catch((e) => { if (alive) setStatus({ error: (e && e.message) || '无法访问 /teacher-kit/api/status' }) })
+    return () => { alive = false }
+  }, [open, status])
+
+  // locked：宿主若把输入区锁了（正在跑模型），就别把老师塞进一个开了也点不动的面板（M2）。
+  const trigger = h(
+    'button',
+    {
+      type: 'button',
+      style: Object.assign({}, TRIGGER, locked ? { opacity: 0.55, cursor: 'not-allowed' } : null),
+      title: locked ? '等这一轮回答结束再打开' : '教师助手：出试卷 / 题库组卷 / 听写单 / 教案 / 做课件 / 文件加工 / 模板',
+      'aria-label': open ? '收起教师助手' : '打开教师助手',
+      'aria-expanded': open ? 'true' : 'false',
+      'aria-disabled': locked ? 'true' : undefined,
+      disabled: locked,
+      onClick: () => { if (!locked) changeOpen(!open) }
+    },
+    h(BookIcon),
+    '教师助手'
+  )
+
+  if (!open) {
+    // 收着的时候只渲染这一个按钮：不请求 /status，也不占任何布局。
+    return h('span', { style: { display: 'contents' } }, trigger, null)
+  }
+
+  // 三个任务做成一行标签页（原来三张大卡要吃掉半屏，选出任务后表单被顶到看不见）。
+  const cards = h(
+    'div',
+    { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+    TASKS.map((task) =>
+      h(
+        'button',
+        {
+          key: task.id,
+          type: 'button',
+          title: task.hint,
+          'aria-pressed': selected === task.id ? 'true' : 'false',
+          style: Object.assign({}, PILL, selected === task.id ? PILL_ON : null),
+          onClick: () => { setSelected(task.id); setResult(null); setError(null) }
+        },
+        task.label
+      )
+    )
+  )
+
+  // 选中任务后把它那句说明留在下面（标签页放不下的信息，这里补一行）。
+  const picked = TASKS.filter(function (task) { return task.id === selected })[0]
+  const pickHint = h(
+    'div',
+    { style: { fontSize: '11px', color: COLORS.muted, lineHeight: 1.6, marginTop: '-2px' } },
+    picked ? picked.hint : '老师最常撞上的几件活：出试卷、题库组卷、听写单、教案、做课件、整套、文件加工、做模板。点一个开始。'
+  )
+
+  const run = function () {
+    if (busy) return
+    if (runSeq) runSeq.current += 1
+    const mine = runSeq ? runSeq.current : 0
+    const mySession = sessionId
+    setBusy(true)
+    setError(null)
+    setResult(null)
+    // 老师想知道"到底花了多久"：从点按钮到出结果计时，写在结果卡右上角
+    const startedAt = Date.now()
+    const task = selected === 'exam' ? buildExam(draft, { pdf: true })
+      : selected === 'bank' ? buildBank(draft, { pdf: true })
+        : selected === 'dictation' ? buildDictation(draft, { pdf: true })
+          : selected === 'plan' ? buildPlan(draft, { pdf: true })
+              : selected === 'deck' ? buildDeck(draft, {})
+                : selected === 'pack' ? buildPack(draft, {})
+                : selected === 'template' ? buildTemplate(draft) : processFiles(draft)
+    task
+      .then(function (value) {
+        if (stale(mine, mySession)) return
+        if (value && typeof value === 'object') {
+          value.elapsedSec = Math.max(0.1, Math.round((Date.now() - startedAt) / 100) / 10)
+        }
+        setResult(value)
+      })
+      .catch(function (failure) {
+        if (stale(mine, mySession)) return
+        setError({
+          message: failure && failure.message ? failure.message : '这一步没跑通',
+          hint: failure && failure.hint ? failure.hint : ''
+        })
+      })
+      .then(function () { if (!stale(mine, mySession)) setBusy(false) })
+  }
+
+  const textarea = function (key, rows, placeholder) {
+    return h('textarea', {
+      key: key,
+      rows: rows,
+      placeholder: placeholder,
+      autoFocus: key === 'text',
+      value: draft[key] || '',
+      style: Object.assign({}, INPUT, { resize: 'vertical', lineHeight: 1.5 }),
+      onChange: (event) => changeField(key, event.target.value)
+    })
+  }
+
+  const textInput = function (key, placeholder) {
+    return h('input', {
+      key: key,
+      type: 'text',
+      placeholder: placeholder,
+      value: draft[key] || '',
+      style: INPUT,
+      onChange: (event) => changeField(key, event.target.value)
+    })
+  }
+
+  /** 带"浏览…"的路径输入：老师点文件夹选，不用背绝对路径。 */
+  const pathField = function (key, placeholder, kinds, options) {
+    const extra = options || {}
+    return h(
+      'div',
+      { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
+      h('div', { style: { flex: '1 1 auto', minWidth: 0 } }, textInput(key, placeholder)),
+      h(
+        'button',
+        {
+          type: 'button',
+          style: Object.assign({}, TRIGGER, { height: '30px', flex: '0 0 auto' }),
+          onClick: function () { setBrowse({ key: key, kinds: kinds, append: Boolean(extra.append) }) }
+        },
+        '浏览…'
+      )
+    )
+  }
+
+  const pickFile = function (path) {
+    const target = browse
+    setBrowse(null)
+    if (!target) return
+    if (target.extract) {
+      // 从一份现成的 Word 卷子里把题干读出来，填进输入框（老师再改两笔就能出卷）。
+      setBusy(true)
+      setError(null)
+      engine('docx:extract', { path: path }).then(function (data) {
+        const text = String((data && data.text) || '').trim()
+        if (!text) throw new Error('这份 Word 里没读到文字（可能是扫描件或图片）')
+        // 一次写回：连着调两次 changeField 会用同一个旧 draft，后一次把前一次覆盖掉
+        const next = Object.assign({}, draft)
+        next.text = text
+        if (!String(next.title || '').trim()) {
+          const firstLine = text.split(/\r?\n/).map(function (line) { return line.trim() }).filter(Boolean)[0] || ''
+          if (firstLine && firstLine.length <= 30) next.title = firstLine
+        }
+        setDraft(next)
+      }).catch(function (failure) {
+        setError({
+          message: (failure && failure.message) || '没能读出题干',
+          hint: (failure && failure.hint) || ''
+        })
+      }).then(function () { setBusy(false) })
+      return
+    }
+    if (target.append) {
+      const previous = String(draft[target.key] || '').trim()
+      changeField(target.key, previous ? previous + '\n' + path : path)
+      return
+    }
+    changeField(target.key, path)
+  }
+
+  const checkbox = function (key, labelText) {
+    return h(
+      'label',
+      { key: key, style: { display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: COLORS.muted } },
+      h('input', {
+        type: 'checkbox',
+        checked: Boolean(draft[key]),
+        onChange: (event) => changeField(key, event.target.checked)
+      }),
+      labelText
+    )
+  }
+
+  let form = null
+  if (selected === 'exam') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '卷子名称'), textInput('title', '七年级英语期中测试卷')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '学校模板（可不填）'), pathField('template', '点「浏览…」选学校那份空白卷子', ['docx'])),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '使用班级（印在页脚，可不填）'), textInput('className', '七(3)班')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '出卷老师（印在页脚，可不填）'), textInput('teacherName', '王老师')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '考试时长（分钟）'), textInput('minutes', '90')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '纸型 / 版式'),
+        h('select', {
+          value: draft.paper || '8K-2',
+          style: INPUT,
+          onChange: (event) => changeField('paper', event.target.value)
+        },
+          h('option', { value: '8K-2' }, '8 开横向 · 两栏（大型考试最常用）'),
+          h('option', { value: '8K-1' }, '8 开横向 · 一栏（题少、图多）'),
+          h('option', { value: 'A3-2' }, 'A3 横向 · 两栏（和 8 开差不多大）'),
+          h('option', { value: 'A3-1' }, 'A3 横向 · 一栏'),
+          h('option', { value: '16K-1' }, '16 开 · 一栏（单元小测、随堂练）'),
+          h('option', { value: 'A4-1' }, 'A4 · 一栏（打印最省事）'))),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+          h('span', { style: LABEL }, '题干（一、二、大题 + 1. 2. 小题 + A. B. 选项 + 【答案】）'),
+          h('button', {
+            type: 'button',
+            style: Object.assign({}, TRIGGER, { height: '24px', fontSize: '11px', marginLeft: 'auto' }),
+            disabled: busy,
+            onClick: function () { setBrowse({ extract: true, kinds: ['docx'], key: 'text' }) }
+          }, '从 Word 卷子里读题干')),
+        textarea('text', 6, '一、听力（20 分）\n1. What does the boy want to buy?\nA. A book  B. A pen  C. A bag  D. A cup\n…')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+          h('span', { style: LABEL }, '听力录音稿（可不填：贴了就念成音频）'),
+          h('span', { style: { fontSize: '11px', color: COLORS.muted, marginLeft: 'auto' } }, '一行一句，中英混排也行')),
+        textarea('listening', 4, 'What does the boy want to buy?\nHe wants to buy a schoolbag.\nWhere are they talking?')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        checkbox('listeningAudio', '把听力录音稿念成音频（wav，上课播放）'),
+        h('span', { style: { fontSize: '12px', color: COLORS.muted } }, '整段念几遍'),
+        h('select', {
+          value: draft.listeningPasses || '1',
+          style: INPUT,
+          onChange: (event) => changeField('listeningPasses', event.target.value)
+        },
+          h('option', { value: '1' }, '念一遍'),
+          h('option', { value: '2' }, '念两遍（中间停 4 秒，考试常用）'),
+          h('option', { value: '3' }, '念三遍'))),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        checkbox('card', '附答题卡（A4）'),
+        h('span', { style: { fontSize: '12px', color: COLORS.muted } }, '填空题留几行'),
+        h('select', {
+          value: draft.fillLines || '2',
+          style: INPUT,
+          onChange: (event) => changeField('fillLines', event.target.value)
+        },
+          h('option', { value: '2' }, '两行（写单词/短语）'),
+          h('option', { value: '3' }, '三行（写句子）'),
+          h('option', { value: '4' }, '四行（简答/翻译）')),
+        checkbox('answers', '附参考答案'),
+        checkbox('ab', '出 A/B 两套（B 卷选项顺序打乱）'),
+        checkbox('teacher', '另出一份教师卷（答案和解析印在题后）'),
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run }, busy ? '正在出卷…' : '出卷并导出 PDF'))
+    )
+  } else if (selected === 'bank') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '题库文件（Excel / Word 表格 / CSV）'), pathField('source', '点「浏览…」选题库文件', ['xlsx', 'docx', 'csv'])),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '套学校模板（可不填）'),
+        pathField('template', '点「浏览…」选学校那份空白卷子（题库组的卷子也能套）', ['docx'])),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } },
+        h('button', {
+          type: 'button',
+          style: {
+            padding: '5px 12px',
+            fontSize: '12px',
+            borderRadius: '999px',
+            border: '1px solid ' + COLORS.border,
+            background: 'transparent',
+            color: 'inherit',
+            cursor: busy ? 'default' : 'pointer',
+            opacity: busy ? 0.55 : 1
+          },
+          disabled: busy,
+          onClick: inspectBank
+        }, '看看题库里有什么'),
+        bankInfo
+          ? h('span', { style: { fontSize: '12px', color: bankInfo.error ? COLORS.bad : COLORS.muted } },
+            bankInfo.loading ? '正在读题库…' : (bankInfo.error || bankInfo.text))
+          : h('span', { style: { fontSize: '12px', color: COLORS.muted } }, '先看一眼有多少题、都有哪些题型，再决定挑几道')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '卷子名称'), textInput('title', '七年级英语单元小测')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '使用班级（印在页脚，可不填）'), textInput('className', '七(3)班')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '出卷老师（印在页脚，可不填）'), textInput('teacherName', '王老师')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '考试时长（分钟）'), textInput('minutes', '60')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '纸型 / 版式'),
+        h('select', {
+          value: draft.paper || '8K-2',
+          style: INPUT,
+          onChange: (event) => changeField('paper', event.target.value)
+        },
+          h('option', { value: '8K-2' }, '8 开横向 · 两栏（大型考试最常用）'),
+          h('option', { value: '8K-1' }, '8 开横向 · 一栏'),
+          h('option', { value: 'A3-2' }, 'A3 横向 · 两栏'),
+          h('option', { value: 'A3-1' }, 'A3 横向 · 一栏'),
+          h('option', { value: '16K-1' }, '16 开 · 一栏（单元小测）'),
+          h('option', { value: 'A4-1' }, 'A4 · 一栏（打印最省事）'))),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '挑题（不填就用题库里全部；一行一种题型）'),
+        textarea('pick', 3, '单项选择 10\n完形填空 1\n阅读理解 2')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '分成几套（同一批题出多份）'),
+        h('select', {
+          value: draft.sets || '1',
+          style: INPUT,
+          onChange: (event) => changeField('sets', event.target.value)
+        },
+          h('option', { value: '1' }, '就出一份'),
+          h('option', { value: '2' }, '两套（每套题型题量差不多）'),
+          h('option', { value: '3' }, '三套'),
+          h('option', { value: '4' }, '四套'))),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        checkbox('card', '附答题卡（A4）'),
+        h('span', { style: { fontSize: '12px', color: COLORS.muted } }, '填空题留几行'),
+        h('select', {
+          value: draft.fillLines || '2',
+          style: INPUT,
+          onChange: (event) => changeField('fillLines', event.target.value)
+        },
+          h('option', { value: '2' }, '两行（写单词/短语）'),
+          h('option', { value: '3' }, '三行（写句子）'),
+          h('option', { value: '4' }, '四行（简答/翻译）')),
+        checkbox('answers', '附参考答案'),
+        checkbox('ab', '出 A/B 两套（B 卷选项顺序打乱）'),
+        checkbox('teacher', '另出一份教师卷（答案和解析印在题后）'),
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run }, busy ? '正在组卷…' : '组卷并导出 PDF'))
+    )
+  } else if (selected === 'dictation') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '标题'), textInput('title', 'Unit 3 单词听写')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '模式'),
+        h('select', {
+          value: draft.mode || 'en2cn',
+          style: INPUT,
+          onChange: (event) => changeField('mode', event.target.value)
+        },
+          h('option', { value: 'en2cn' }, '看英文写中文（对照表竖着抄）'),
+          h('option', { value: 'cn2en' }, '看中文写英文'),
+          h('option', { value: 'mix' }, '中英混着来'))),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '分几栏'),
+        h('select', {
+          value: draft.columns || '2',
+          style: INPUT,
+          onChange: (event) => changeField('columns', event.target.value)
+        },
+          h('option', { value: '1' }, '1 栏（字大、留白多）'),
+          h('option', { value: '2' }, '2 栏（A4 最常用）'),
+          h('option', { value: '3' }, '3 栏（单词多、省纸）'))),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '或者直接选一个词表文件（Word / Excel / CSV）'),
+        pathField('source', '点「浏览…」选班级交上来的词表', ['docx', 'xlsx', 'csv', 'txt'])),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '单词表（一行一条，英文和中文隔开就行；选了文件这里可以不填）'),
+        textarea('text', 6, 'apple 苹果\nbanana 香蕉\nlook after 照顾\ntomato 西红柿')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        checkbox('answers', '附参考答案（另起一页）'),
+        checkbox('audio', '同时生成听写音频（课堂播放用）'),
+        h('div', { style: FIELD }, h('span', { style: LABEL }, '每条停几秒'),
+          h('select', {
+            value: draft.pause || '6',
+            style: INPUT,
+            onChange: (event) => changeField('pause', event.target.value)
+          },
+            h('option', { value: '4' }, '4 秒（写得快）'),
+            h('option', { value: '6' }, '6 秒（常规）'),
+            h('option', { value: '8' }, '8 秒（词组）'),
+            h('option', { value: '10' }, '10 秒（句子）'))),
+        h('div', { style: FIELD }, h('span', { style: LABEL }, '念几遍'),
+          h('select', {
+            value: draft.repeat || '2',
+            style: INPUT,
+            onChange: (event) => changeField('repeat', event.target.value)
+          },
+            h('option', { value: '1' }, '1 遍'),
+            h('option', { value: '2' }, '2 遍（常规）'),
+            h('option', { value: '3' }, '3 遍（难词）'))),
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run }, busy ? '正在排听写单…' : '出听写单并导出 PDF'))
+    )
+  } else if (selected === 'plan') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '课题'), textInput('title', 'Unit 3 What does he look like？')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '授课教师'), textInput('teacher', '张老师')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '班级'), textInput('className', '七(3)班')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '课时'), textInput('periods', '1 课时')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '版式'),
+        h('select', {
+          value: draft.layout || 'form',
+          style: INPUT,
+          onChange: (event) => changeField('layout', event.target.value)
+        },
+          h('option', { value: 'form' }, '表格式（检查时最稳）'),
+          h('option', { value: 'flow' }, '流程式（看着清楚）'))),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '教案草稿（课题 / 教学目标 / 重点 / 教学过程 / 板书设计… 认得出的小标题都行）'),
+        textarea('text', 7, '课题：Unit 3 What does he look like？\n教学目标：\n1. 掌握描述外貌的 5 个词。\n教学重点：tall / short / thin 的用法。\n教学过程：\n（一）导入：看图片猜人。\n（二）新授：带读单词，同桌互描述。\n板书设计：tall—short；thin—heavy')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '10px', alignItems: 'center' } },
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run }, busy ? '正在排教案…' : '生成教案并导出 PDF'))
+    )
+  } else if (selected === 'deck') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '课题'), textInput('title', 'Unit 3 What does he look like？')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '学校 PPT 模板（可不填，仅 PPTX）'), pathField('template', '点「浏览…」选学校那份课件模板', ['pptx'])),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '输出格式'),
+        h('select', {
+          value: draft.format || 'pptx',
+          style: INPUT,
+          onChange: (event) => changeField('format', event.target.value)
+        },
+          h('option', { value: 'pptx' }, 'PowerPoint .pptx（能改、能投影）'),
+          h('option', { value: 'html' }, '网页课件 .html（借别人的电脑最保险）'))),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '粘贴这节课的内容（【学习目标】/一、二、 小标题 + 要点 + 讲：备注）'),
+        textarea('text', 6, '【学习目标】\n1. 掌握 5 个核心词汇。\n【词汇操练】\n- tall / short / thin\n讲：先带读，再让学生描述同桌。')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '10px', alignItems: 'center' } },
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run }, busy ? '正在做课件…' : '生成课件'))
+    )
+  } else if (selected === 'file') {
+    const action = draft.action || 'clean'
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '动作'),
+        h('select', {
+          value: action,
+          style: INPUT,
+          onChange: (event) => changeField('action', event.target.value)
+        },
+          h('option', { value: 'clean' }, '净化格式（去链接/彩色/大间距）'),
+          h('option', { value: 'batch' }, '批量净化（一堆讲义一次弄干净）'),
+          h('option', { value: 'merge' }, '合并多份（每行一个文件路径）'),
+          h('option', { value: 'extract' }, '提取文字'),
+          h('option', { value: 'check' }, '检查一份卷子（印前检查）'))),
+      action === 'clean' || action === 'batch'
+        ? h('div', { style: FIELD }, h('span', { style: LABEL }, '要统一成什么字体'), textInput('font', '宋体'))
+        : null,
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL },
+          action === 'merge' ? '要合并的文件（点「浏览…」一个一个加，按加入顺序合并）'
+            : action === 'batch' ? '要净化的文件（点「浏览…」一个一个加，也可以一行一个路径）'
+              : action === 'check' ? '要检查的卷子' : '文件'),
+        action === 'merge' || action === 'batch'
+          ? h(
+              'div',
+              { style: { display: 'flex', gap: '6px', alignItems: 'flex-start' } },
+              h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+                textarea('source', 3, action === 'merge' ? '点右边的「浏览…」一个一个加文件（按加入顺序合并）' : '点右边的「浏览…」一个一个加文件')),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: Object.assign({}, TRIGGER, { height: '30px', flex: '0 0 auto' }),
+                  onClick: function () { setBrowse({ key: 'source', kinds: ['docx'], append: true }) }
+                },
+                '浏览…'
+              )
+            )
+          : pathField('source', action === 'check' ? '点「浏览…」选要检查的卷子' : '点「浏览…」选要处理的文档', ['docx'])),
+      action === 'merge'
+        ? h('div', { style: FIELD }, h('span', { style: LABEL }, '页眉页脚怎么带'),
+          h('select', {
+            value: draft.mergeHeaderMode || 'first',
+            style: INPUT,
+            onChange: (event) => changeField('mergeHeaderMode', event.target.value)
+          },
+            h('option', { value: 'first' }, '沿用第一份的（学校抬头只印一次，最常用）'),
+            h('option', { value: 'each' }, '每份保留自己的（不同学校/年级的卷子合在一起）'),
+            h('option', { value: 'none' }, '都不要（只拼正文）')))
+        : null,
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '10px', alignItems: 'center' } },
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run },
+          busy ? '正在处理…' : action === 'check' ? '开始检查' : '开始处理'))
+    )
+  } else if (selected === 'pack') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: { flexBasis: '100%', fontSize: '11px', color: COLORS.muted, lineHeight: 1.6 } },
+        '一节课要用的东西一次做齐：填了哪几栏就出哪几件，空着的跳过。四件互不影响 —— 哪件没做成只报那一件。'),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '课题 / 单元名称'), textInput('title', 'Unit 3 What does he look like?')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '使用班级（印在页脚）'), textInput('className', '七(3)班')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '老师（印在页脚 / 教案抬头）'), textInput('teacherName', '王老师')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '试卷纸型 / 版式'),
+        h('select', {
+          value: draft.paper || '8K-2',
+          style: INPUT,
+          onChange: (event) => changeField('paper', event.target.value)
+        },
+          h('option', { value: '8K-2' }, '8 开横向 · 两栏（大型考试最常用）'),
+          h('option', { value: '8K-1' }, '8 开横向 · 一栏（题少、图多）'),
+          h('option', { value: 'A3-2' }, 'A3 横向 · 两栏'),
+          h('option', { value: 'A3-1' }, 'A3 横向 · 一栏'),
+          h('option', { value: '16K-1' }, '16 开 · 一栏（单元小测、随堂练）'),
+          h('option', { value: 'A4-1' }, 'A4 · 一栏（打印最省事）'))),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '学校卷子模板（可不填）'), pathField('template', '点「浏览…」选学校那份空白卷子', ['docx'])),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '试卷 · 题库文件（有题库就选，和「题库组卷」一样）'),
+        pathField('bankSource', '点「浏览…」选题库（Excel / Word / CSV）；没有就往下粘题干', ['xlsx', 'docx', 'csv'])),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '试卷 · 或者直接粘题干（题库和这里任选一个）'),
+        textarea('paperText', 5, '一、单项选择（每题 2 分，共 10 分）\n1. What does he look like?\nA. He is tall.  B. He is fine.  C. He is ten.  D. He is here.\n【答案】A')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        checkbox('card', '试卷附答题卡（A4）'),
+        checkbox('answers', '试卷附参考答案页')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '听写单 · 词表文件（选了就出，Word / Excel / CSV / txt 都行）'),
+        pathField('wordsSource', '点「浏览…」选班级交上来的词表', ['docx', 'xlsx', 'csv', 'txt'])),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '教案 · 草稿（课题、目标、重点、教学过程… 有这几行就能排版）'),
+        textarea('planText', 4, '教学目标\n1. 掌握 5 个核心词汇\n2. 能用 What does he look like? 询问外貌\n教学过程\n导入：复习上单元词汇（5 分钟）')),
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '课件 · 内容（【学习目标】这种标题自动分页，「讲：」开头的进备注）'),
+        textarea('deckText', 4, '【学习目标】\n1. 掌握 5 个核心词汇\n【词汇操练】\n- tall / short / thin\n讲：先带读两遍。')),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '课件格式'),
+        h('select', {
+          value: draft.format || 'pptx',
+          style: INPUT,
+          onChange: (event) => changeField('format', event.target.value)
+        },
+          h('option', { value: 'pptx' }, 'PowerPoint .pptx（还能接着改）'),
+          h('option', { value: 'html' }, '网页课件 .html（双击就能放）'))),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '学校 PPT 模板（可不填）'), pathField('deckTemplate', '点「浏览…」选学校那份 PPT 模板', ['pptx'])),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '10px', alignItems: 'center' } },
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run },
+          busy ? '正在一件件做…' : '一次做齐'))
+    )
+  } else if (selected === 'template') {
+    form = h(
+      'div',
+      { style: FORM },
+      h('div', { style: { flexBasis: '100%', display: 'flex', flexDirection: 'column', gap: '4px' } },
+        h('span', { style: LABEL }, '上学期那份卷子（用它定版式；页眉页脚里的学年/页码会换成占位符）'),
+        pathField('source', '点「浏览…」选上学期做好的卷子', ['docx'])),
+      h('div', { style: FIELD }, h('span', { style: LABEL }, '模板存哪（不填就存在原文件旁边，名字加「-模板」)'), textInput('outputPath', '例如 D:/模板/英语卷模板.docx')),
+      h('div', { style: { flexBasis: '100%', fontSize: '11px', color: COLORS.muted, lineHeight: 1.6 } },
+        '做好以后，在「出试卷」里把这份模板选上，正文粘题目就行 —— 版式还是你原来那份，一个字没动。'),
+      h('div', { style: { flexBasis: '100%', display: 'flex', gap: '10px', alignItems: 'center' } },
+        h('button', { type: 'button', style: BUSY_STYLE(busy), disabled: busy, onClick: run }, busy ? '正在做模板…' : '生成模板'))
+    )
+  }
+
+  // ── v0.16 面板主体：学校画像卡 + 分组任务 + 最近一次投递结果 ──────────────
+  const guideTasks = (guideInfo && Array.isArray(guideInfo.tasks) && guideInfo.tasks.length) ? guideInfo.tasks : GUIDE_FALLBACK
+  const profileData = (guideInfo && guideInfo.profile) || {}
+  const profileFields = profileData.profile || {}
+  const profileKnown = profileData.exists === true && typeof profileData.text === 'string' && profileData.text.trim() !== ''
+  const chips = profileChips(profileFields)
+  const taskByKey = {}
+  guideTasks.forEach(function (task) { if (task && task.key) taskByKey[task.key] = task })
+
+  const profileButton = h(
+    'button',
+    {
+      type: 'button',
+      className: 'tk-ghost',
+      disabled: !!launching,
+      title: profileKnown ? '改学校画像（会进对话里问）' : '把学校、学段学科、卷面规格、教案版式记下来',
+      onClick: function () { launchTask('profile') }
+    },
+    profileKnown ? '改一下' : '设定我的学校'
+  )
+
+  const profileCard = h(
+    'div',
+    { className: 'tk-profile' },
+    chips.length
+      ? h(
+          'div',
+          { className: 'tk-chips' },
+          chips.map(function (chip) {
+            return h(
+              'span',
+              { key: chip.key, className: 'tk-chip', title: chip.label + '：' + chip.value },
+              h('span', { className: 'tk-chip-key' }, chip.label),
+              h('span', { className: 'tk-chip-val' }, chip.value)
+            )
+          })
+        )
+      : h(
+          'span',
+          { className: 'tk-profile-empty' },
+          profileKnown
+            ? '已记住你学校的习惯（纸型 / 教案版式 / 课件风格）'
+            : '还没设学校 —— 说一次就好：纸型、页脚怎么写、教案版式、公文单位都记下来，以后每次自动带上'
+        ),
+    profileButton
+  )
+
+  // 一个任务 = 一行：图标 + 名字 + 一句说明 + 箭头。点下去就往对话里投一条，面板里不问任何东西。
+  const taskRow = function (task) {
+    const busyThis = launching === task.key
+    const blocked = !!launching && !busyThis
+    return h(
+      'button',
+      {
+        key: task.key,
+        type: 'button',
+        className: 'tk-row',
+        disabled: blocked,
+        title: task.brief || task.label,
+        onClick: function () { launchTask(task.key) }
+      },
+      busyThis ? h('span', { className: 'tk-row-icon' }, h('span', { className: 'tk-spin' })) : h(TaskIcon, { name: task.key }),
+      h(
+        'span',
+        { className: 'tk-row-main' },
+        h('span', { className: 'tk-row-label' }, busyThis ? task.label + ' …' : task.label),
+        h('span', { className: 'tk-row-brief' }, task.brief || '')
+      ),
+      h(Chevron)
+    )
+  }
+
+  const groupKeys = {}
+  TASK_GROUPS.forEach(function (group) {
+    group.keys.forEach(function (key) { groupKeys[key] = true })
+  })
+  const looseTasks = guideTasks.filter(function (task) {
+    return task && task.key && task.key !== 'profile' && !groupKeys[task.key]
+  })
+  const groupsEls = TASK_GROUPS.map(function (group) {
+    const rows = group.keys
+      .map(function (key) { return taskByKey[key] })
+      .filter(Boolean)
+      .map(taskRow)
+    if (!rows.length) return null
+    return h(
+      'section',
+      { key: group.title, className: 'tk-group' },
+      h('div', { className: 'tk-group-title' }, group.title),
+      rows
+    )
+  }).filter(Boolean)
+  if (looseTasks.length) {
+    groupsEls.push(
+      h(
+        'section',
+        { key: 'more', className: 'tk-group' },
+        h('div', { className: 'tk-group-title' }, '其他'),
+        looseTasks.map(taskRow)
+      )
+    )
+  }
+
+  // 投进对话之后的回执：成功就准备收起（1.2s），失败就把这段话还给老师，别装成功。
+  const launchedNote = launched
+    ? h(
+        'div',
+        { className: 'tk-note' },
+        h(
+          'p',
+          { className: launched.ok ? 'tk-note-ok' : 'tk-note-bad', style: { margin: '0 0 6px' } },
+          launched.ok
+            ? '已经放进对话里了 —— 在下面接着聊，缺什么它会问你要。'
+            : '没能自动开始对话' + (launched.hint ? '（' + launched.hint + '）' : '') + '。'
+        ),
+        launched.ok
+          ? null
+          : h(
+              'div',
+              { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+              h(
+                'button',
+                { type: 'button', className: 'tk-ghost', onClick: function () { copyGuide(launched.text) } },
+                copyState === 'copied' ? '已复制 ✓' : '复制这段话'
+              ),
+              h(
+                'span',
+                { style: { color: copyState === 'manual' ? COLORS.bad : COLORS.muted, fontSize: '11.5px' } },
+                copyState === 'manual'
+                  ? '浏览器不让直接写剪贴板：点下面那框全选后 Ctrl+C。'
+                  : '贴到下面的输入框，一样能开始。'
+              )
+            ),
+        launched.ok
+          ? null
+          : h('textarea', {
+              readOnly: true,
+              rows: 4,
+              value: launched.text,
+              style: Object.assign({}, INPUT, { fontSize: '11px', lineHeight: 1.5 })
+            })
+      )
+    : null
+
+  const oldToggle = h(
+    'button',
+    {
+      type: 'button',
+      className: 'tk-old-toggle',
+      'aria-expanded': oldMode ? 'true' : 'false',
+      onClick: function () { setOldMode(!oldMode) }
+    },
+    oldMode ? '收起「直接出成品」' : '直接出成品（老方式：填表就出，不经过对话）'
+  )
+
+  const panel = h(
+    'div',
+    {
+      className: 'tk-panel',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': '教师助手',
+      tabIndex: -1,
+      ref: panelRef
+    },
+    h('style', { key: 'tk-style' }, PANEL_CSS),
+    h(
+      'div',
+      { className: 'tk-head' },
+      h('span', { className: 'tk-head-icon' }, h(BookIcon)),
+      h('span', { className: 'tk-title' }, '教师助手'),
+      h('span', { className: 'tk-sub' }, '选一件事，剩下的在对话里问你'),
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'tk-x',
+          'aria-label': '关闭教师助手',
+          title: '关闭（Esc）',
+          onClick: function () { changeOpen(false) }
+        },
+        '✕'
+      )
+    ),
+    // 中间这层自己滚：头部和底栏（引擎状态 / 收起）永远在视野里，不用往下找。
+    h(
+      'div',
+      { className: 'tk-body' },
+      profileCard,
+      groupsEls,
+      launchedNote,
+      h('div', { className: 'tk-old' }, oldToggle),
+      oldMode ? cards : null,
+      oldMode ? pickHint : null,
+      browse
+        ? h(FilePicker, {
+            kinds: browse.kinds,
+            startDir: loadLastDir(),
+            onPick: pickFile,
+            onCancel: function () { setBrowse(null) }
+          })
+        : null,
+      error
+        ? h('div', { className: 'tk-note tk-note-bad' },
+            '没跑通：' + error.message + (error.hint ? '（' + error.hint + '）' : ''))
+        : null,
+      oldMode ? form : null,
+      oldMode ? h(ResultCard, { result: result, onReveal: reveal }) : null
+    ),
+    h(
+      'div',
+      { className: 'tk-foot' },
+      h(StatusChip, {
+        state: status,
+        // 检查不过时点一下重查：宿主会重新探 Python/LibreOffice（/status?refresh=1 太重，这里走普通重探）
+        onRetry: function () { setStatus(null) }
+      }),
+      h(
+        'button',
+        { type: 'button', className: 'tk-ghost', style: { marginLeft: 'auto' }, onClick: function () { changeOpen(false) } },
+        '收起'
+      )
+    )
+  )
+
+  // display:contents 的 span：遮罩是 fixed，不受工具栏 flex 布局影响。
+  return h(
+    'span',
+    { style: { display: 'contents' } },
+    trigger,
+    h(
+      'div',
+      {
+        className: 'tk-backdrop',
+        onMouseDown: function (event) { if (event && event.target === event.currentTarget) changeOpen(false) }
+      },
+      panel
+    )
+  )
+}
+
+function BUSY_STYLE(busy) {
+  return Object.assign({}, BUTTON, busy ? { opacity: 0.6, cursor: 'not-allowed' } : null)
+}
+
+/** 客户端入口：只等 slots 一个服务。 */
+function apply(ctx) {
+  try {
+    // list 槽必须给 id（真机报过 "list slot \"conversation.input.right\" requires options.id"）；
+    // single 槽则必须给 priority（同优先级会互相挤掉，见文件头那段事故）。
+    const register = () => ctx.slots.register({ name: SLOT, id: NS }, TeacherKit)
+    ctx.slots.inject(SLOT, register)
+  } catch (error) {
+    // 客户端半边失败只影响这一个按钮；绝不让异常冒泡（壳会整页白屏）。
+    try { ctx.logger && ctx.logger.warn && ctx.logger.warn('[dsh-teacher-kit] 面板挂载失败：' + String(error)) } catch { /* ignore */ }
+  }
+}
+
+exports.apply = apply
+exports.inject = ['slots']
+exports.name = NS

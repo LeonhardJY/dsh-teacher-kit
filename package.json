@@ -1,0 +1,80 @@
+{
+  "name": "dsh-teacher-kit",
+  "version": "0.18.0",
+  "private": false,
+  "license": "MIT",
+  "author": {
+    "name": "GoldenUniverse",
+    "url": "https://github.com/LeonhardJY"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeonhardJY/dsh-teacher-kit.git"
+  },
+  "homepage": "https://github.com/LeonhardJY/dsh-teacher-kit#readme",
+  "bugs": {
+    "url": "https://github.com/LeonhardJY/dsh-teacher-kit/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "teacher",
+    "教师",
+    "试卷",
+    "课件",
+    "word",
+    "pptx",
+    "education"
+  ],
+  "type": "module",
+  "description": "Teacher's office assistant for China's middle schools: exams, lesson plans, slide decks and docx work on your own school templates — local, inside the DSH chat.",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./client/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "engine/cli.py",
+    "engine/teacher_kit",
+    "scripts/build-client.mjs",
+    "scripts/install-local.mjs",
+    "scripts/package.mjs",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md",
+    "RELEASE.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "external": []
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.1-rc.2",
+    "react": "^18.2.0"
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "smoke": "node test/smoke.mjs",
+    "package": "node scripts/package.mjs",
+    "install-local": "node scripts/install-local.mjs",
+    "flow-check": "node scripts/flow-check.mjs",
+    "perf": "node scripts/perf-check.mjs"
+  }
+}

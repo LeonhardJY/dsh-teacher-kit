@@ -69,6 +69,19 @@ https://fastly.jsdelivr.net/gh/LeonhardJY/dsh-teacher-kit@main/market/index.json
    加 `--uninstall` 卸掉。）
 3. **重启 DSH**（关掉窗口再打开），打开任意对话，输入框下方应出现「教师助手」。
 
+### 办法 C：离线一键安装包（不会用命令行就走这条）
+
+`dist/dsh-teacher-kit-<版本>-offline-win.zip` 是给「电脑上没装 Node、也不方便连 GitHub」的机器准备的：
+
+1. 把整个压缩包解压到桌面或任意文件夹（**不要在压缩包里直接双击**，Windows 会找不到文件）
+2. 双击 `一键安装.cmd`（若弹「Windows 已保护你的电脑」→ 更多信息 → 仍要运行）
+3. 看到「装好了」以后**完全退出 DSH 再重新打开**
+
+脚本是纯 PowerShell（源码在 `offline-installer/install.ps1`），不依赖 Node、不联网：
+自动装进本机所有现成的 profile（desktop / web / headless），重复双击等于覆盖安装；
+`一键卸载.cmd` 只删插件自己的文件和 `cordis.patch.yml` 里那一小段，不碰别的配置。
+重新打包：`python scripts/pack-offline.py`。
+
 装好后可以随时验证：设置 → 插件市场 → 已安装，能看到 `dsh-teacher-kit`；
 或者在对话里让助手调用 `teacher_kit_status`，它应该回 Python 与 LibreOffice 的版本。
 
@@ -373,9 +386,12 @@ https://fastly.jsdelivr.net/gh/LeonhardJY/dsh-teacher-kit@main/market/index.json
 
 ## 十一、给别人装 / 开发
 
-**给别人装**：把 `dist/dsh-teacher-kit-<版本>.zip` 解压到任意目录，在解压目录里执行
+**给别人装**（对方是老师、不会用命令行）：把 `dist/dsh-teacher-kit-<版本>-offline-win.zip` 发过去，
+让她解压后双击 `一键安装.cmd`、再重启 DSH 就行——不需要 Node、不需要联网、不需要 GitHub。
+
+**给别人装（对方会用命令行）**：把 `dist/dsh-teacher-kit-<版本>.zip` 解压到任意目录，在解压目录里执行
 `node scripts/install-local.mjs --profile desktop`（用 `dsh web` 的写 `web`），重启 DSH 即可。
-包里已经带好宿主、面板和 Python 引擎，**不需要** `src/`、`test/`，也不用另外装 Python 包。
+两种包都带好了宿主、面板和 Python 引擎，**不需要** `src/`、`test/`，也不用另外装 Python 包。
 
 **开发**（下面这些只在工程目录里能跑，发布包里没有 `src/`、`test/`、`engine/tests/`）：
 
@@ -385,6 +401,7 @@ node scripts/build-client.mjs     # 改过 src/client/factory.js 后必须重新
 node test/smoke.mjs               # 面板装配 / 路由 / 引擎桥 端到端自测
 node scripts/flow-check.mjs       # 九条路由 + 引擎命令清单
 node scripts/perf-check.mjs       # 热路径耗时（画像 / 状态 / 投递）
+python scripts/pack-offline.py    # 重新打离线一键安装包
 ```
 
 引擎侧 14 套测试（在 `engine/tests` 下，用 DSH 自带 Python 跑）：

@@ -7,6 +7,8 @@ tmp-review/
 _probe/
 reviews/
 dist/
+dist-offline/
+offline-installer/plugin/
 node_modules/
 *.log
 __pycache__/

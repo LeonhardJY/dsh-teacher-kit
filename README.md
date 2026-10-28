@@ -38,9 +38,16 @@
 
 要求：Windows 上的 DeepSeek Harness（桌面版或 `dsh web`），版本 `>= 0.2.1-rc.2`。
 
-### 办法 A：插件市场（发布后）
+### 办法 A：插件市场（索引源）
 
-设置 → **插件市场** → 搜「教师助手」→ 安装 → 刷新页面。
+设置 → **插件市场** → **发现** → 索引源填下面这个地址，回车/保存：
+
+```
+https://raw.githubusercontent.com/LeonhardJY/dsh-teacher-kit/main/market/index.json
+```
+
+刷新后出现「教师助手」卡片 → 安装（实际走 `git+https://github.com/LeonhardJY/dsh-teacher-kit.git#<提交号>`，
+固定在某个提交上，不会随便变）→ 重启 DSH。
 
 ### 办法 B：本地安装（现在）
 

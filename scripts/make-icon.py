@@ -31,6 +31,9 @@ tw, th = bb[2] - bb[0], bb[3] - bb[1]
 d.text(((S - tw) / 2 - bb[0], S * 0.50 - th / 2 - bb[1] + 18), text, font=font, fill=(255, 255, 255, 255))
 
 os.makedirs("market", exist_ok=True)
+os.makedirs("assets", exist_ok=True)
+out.resize((512, 512), Image.LANCZOS).save("assets/icon-512.png")
+out.resize((180, 180), Image.LANCZOS).save("assets/icon-180.png")
 out.resize((256, 256), Image.LANCZOS).save("market/icon-256.png")
 small = out.resize((128, 128), Image.LANCZOS)
 buf = io.BytesIO()

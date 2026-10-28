@@ -1,0 +1,8 @@
+url: https://github.com/LeonhardJY/dsh-teacher-kit
+name: LeonhardJY/dsh-teacher-kit
+category: docs
+description:
+  en: Builds exams, question-bank papers, dictation sheets, lesson plans, slide decks and full lesson packs on a school's own Word template, plus docx/pptx batch jobs, driven from the chat with a per-school profile that remembers each school's layout habits.
+  zh: 用学校自己的 Word 模板出试卷、按题库组卷、听写单、教案、课件与一节课整套，另做 docx/pptx 批量加工；在对话里一步步问清要求，并按学校画像记住每所学校的版式习惯。
+icon: https://raw.githubusercontent.com/LeonhardJY/dsh-teacher-kit/main/assets/icon-180.png
+tarball: https://github.com/LeonhardJY/dsh-teacher-kit/releases/download/v0.18.0/dsh-teacher-kit-0.18.0.tgz
